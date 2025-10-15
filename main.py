@@ -12,7 +12,7 @@ from threading import Thread
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
-CONCURRENT_DOWNLOADS = 3
+CONCURRENT_DOWNLOADS = 15
 # ==================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
