@@ -71,18 +71,17 @@ async def download_and_send(update: Update, link: str):
 
 
 
-import re
-import asyncio
-
 async def handle_message(update, context):
-    # Get the raw message
-    text = update.message.text
+    # Get text from message or caption (for photos/videos with text)
+    text = update.message.text or update.message.caption
+    if not text:
+        return  # Nothing to process
 
-    # ✅ Normalize text: remove invisible characters and excessive whitespace
-    clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)  # keep only standard ASCII chars
-    clean_text = re.sub(r"\s+", " ", clean_text)      # replace multiple spaces/newlines with single space
+    # Normalize text to remove weird unicode/formatting
+    clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
+    clean_text = re.sub(r"\s+", " ", clean_text)
 
-    # ✅ Regex to match Terabox /s/ links with proper share IDs
+    # Detect Terabox /s/ links
     links = re.findall(
         r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+",
         clean_text
