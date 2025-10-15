@@ -71,24 +71,32 @@ async def download_and_send(update: Update, link: str):
 
 
 
-async def handle_message(update, context):
-    text = update.message.text.strip()
+import re
+import asyncio
 
-    # ✅ Regex to automatically detect Terabox links (only /s/ links with share ID)
+async def handle_message(update, context):
+    # Get the raw message
+    text = update.message.text
+
+    # ✅ Normalize text: remove invisible characters and excessive whitespace
+    clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)  # keep only standard ASCII chars
+    clean_text = re.sub(r"\s+", " ", clean_text)      # replace multiple spaces/newlines with single space
+
+    # ✅ Regex to match Terabox /s/ links with proper share IDs
     links = re.findall(
         r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+",
-        text
+        clean_text
     )
 
     if not links:
-        return await update.message.reply_text("❌ No valid Terabox link found in your message.")
+        return await update.message.reply_text("❌ No valid Terabox link found.")
 
     # Remove duplicates
     links = list(dict.fromkeys(links))
 
     await update.message.reply_text(f"🔍 Found {len(links)} Terabox link(s). Starting downloads...")
 
-    # Start downloading each link respecting concurrency
+    # Start downloads with concurrency
     tasks = []
     for link in links:
         async with semaphore:
