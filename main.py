@@ -75,34 +75,50 @@ import re
 import asyncio
 
 async def handle_message(update, context):
-    # Get the message text: either plain text or caption of media
-    text = update.message.text or getattr(update.message, "caption", None)
-    if not text:
-        return  # nothing to process
+    # Initialize empty text variable
+    text = None
 
-    # Normalize text: remove emojis / invisible unicode chars
+    # 1️⃣ Check plain text
+    if update.message.text:
+        text = update.message.text
+
+    # 2️⃣ Check media captions if text is empty
+    elif hasattr(update.message, "caption") and update.message.caption:
+        text = update.message.caption
+
+    # 3️⃣ Nothing to process
+    if not text:
+        return
+
+    # Normalize text: remove emojis / invisible chars and collapse spaces
     clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
     clean_text = re.sub(r"\s+", " ", clean_text)
 
-    # Detect Terabox links
+    # Regex: detect full Terabox /s/ links
     links = re.findall(
         r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+",
         clean_text
     )
 
     if not links:
-        return  # no Terabox link
+        return  # No Terabox link detected
 
     # Remove duplicates
     links = list(dict.fromkeys(links))
 
-    # Start downloading automatically
+    # Optional: "processing" message
+    msg = await update.message.reply_text(f"🔍 Found {len(links)} Terabox link(s). Starting downloads...")
+
+    # Download links concurrently
     tasks = []
     for link in links:
         async with semaphore:
             tasks.append(asyncio.create_task(download_and_send(update, link)))
 
     await asyncio.gather(*tasks)
+
+    # Delete "processing" message
+    await msg.delete()
 # ===== Telegram Launcher =====
 def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
