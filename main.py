@@ -72,13 +72,12 @@ async def download_and_send(update: Update, link: str):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # Remove invisible characters and excessive dots/spaces
-    clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)  # remove non-ASCII chars
-    clean_text = clean_text.replace("•", " ").replace("…", " ")
+    # Clean invisible or weird characters
+    clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
 
-    # Regex to catch any Terabox link, even if surrounded by emojis or line breaks
+    # Detect full Terabox links with share IDs
     links = re.findall(
-        r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/[A-Za-z0-9]+",
+        r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9]+",
         clean_text
     )
 
