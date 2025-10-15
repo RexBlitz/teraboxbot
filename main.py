@@ -28,97 +28,89 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def download_and_send(update: Update, link: str):
-    try:
-        # Step 1: Get info from API
-        resp = requests.get(f"{API_BASE}?url={link}", timeout=60)
-        data = resp.json()
-
-        if not data.get("success") or not data.get("files"):
-            return await update.message.reply_text(f"❌ Failed to get info for:\n{link}")
-
-        file = data["files"][0]
-        filename = file["file_name"]
-        size = file["size"]
-        download_url = file["download_url"]
-        size_bytes = int(file.get("size_bytes", 0))
-
-        caption = f"🎬 *{filename}*\n📦 Size: {size}\n"
-
-        # Step 2: If > 2GB → send link only
-        if size_bytes > MAX_FILE_SIZE:
-            caption += f"\n⚠️ File > 2GB.\n📥 [Download Link]({download_url})"
-            return await update.message.reply_text(caption, parse_mode="Markdown")
-
-        # Step 3: Download and send directly
-        file_path = f"/tmp/{filename}"
-        with requests.get(download_url, stream=True) as r:
-            r.raise_for_status()
-            with open(file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-        await update.message.reply_video(
-            video=open(file_path, "rb"),
-            caption=caption,
-            parse_mode="Markdown"
-        )
-
-        os.remove(file_path)
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error:\n`{e}`", parse_mode="Markdown")
-
-
-
-import re
 import asyncio
+import re
+import os
+import requests
+from telegram import Update
+from telegram.ext import ContextTypes
+
+# Your semaphore limits concurrent downloads
+semaphore = asyncio.Semaphore(15)  # adjust CONCURRENT_DOWNLOADS as needed
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
+
+
+async def download_and_send(update: Update, link: str):
+    async with semaphore:  # Limit concurrent downloads
+        try:
+            resp = requests.get(f"{API_BASE}?url={link}", timeout=60)
+            data = resp.json()
+
+            if not data.get("success") or not data.get("files"):
+                return await update.message.reply_text(f"❌ Failed: {link}")
+
+            file = data["files"][0]
+            filename = file["file_name"]
+            size = file["size"]
+            download_url = file["download_url"]
+            size_bytes = int(file.get("size_bytes", 0))
+
+            caption = f"🎬 *{filename}*\n📦 Size: {size}\n"
+
+            if size_bytes > MAX_FILE_SIZE:
+                caption += f"\n⚠️ File > 2GB.\n📥 [Download Link]({download_url})"
+                return await update.message.reply_text(caption, parse_mode="Markdown")
+
+            # Download file in chunks
+            file_path = f"/tmp/{filename}"
+            with requests.get(download_url, stream=True) as r:
+                r.raise_for_status()
+                with open(file_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+            # Send video immediately
+            await update.message.reply_video(
+                video=open(file_path, "rb"),
+                caption=caption,
+                parse_mode="Markdown"
+            )
+
+            os.remove(file_path)
+
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error:\n`{e}`", parse_mode="Markdown")
+
 
 async def handle_message(update, context):
-    # Initialize empty text variable
-    text = None
-
-    # 1️⃣ Check plain text
-    if update.message.text:
-        text = update.message.text
-
-    # 2️⃣ Check media captions if text is empty
-    elif hasattr(update.message, "caption") and update.message.caption:
-        text = update.message.caption
-
-    # 3️⃣ Nothing to process
+    # Extract text from message or caption
+    text = update.message.text or getattr(update.message, "caption", None)
     if not text:
         return
 
-    # Normalize text: remove emojis / invisible chars and collapse spaces
+    # Clean text
     clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
     clean_text = re.sub(r"\s+", " ", clean_text)
 
-    # Regex: detect full Terabox /s/ links
-    links = re.findall(
-        r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+",
-        clean_text
-    )
+    # Find Terabox links
+    links = list(dict.fromkeys(
+        re.findall(r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+", clean_text)
+    ))
 
     if not links:
-        return  # No Terabox link detected
+        return
 
-    # Remove duplicates
-    links = list(dict.fromkeys(links))
+    msg = await update.message.reply_text(f"🔍 Found {len(links)} link(s). Starting downloads...")
 
-    # Optional: "processing" message
-    msg = await update.message.reply_text(f"🔍 Found {len(links)} Terabox link(s). Starting downloads...")
+    # Process links in batches using semaphore
+    for i in range(0, len(links), 15):  # batch size = CONCURRENT_DOWNLOADS
+        batch = links[i:i+15]
+        tasks = [asyncio.create_task(download_and_send(update, link)) for link in batch]
+        await asyncio.gather(*tasks)
 
-    # Download links concurrently
-    tasks = []
-    for link in links:
-        async with semaphore:
-            tasks.append(asyncio.create_task(download_and_send(update, link)))
-
-    await asyncio.gather(*tasks)
-
-    # Delete "processing" message
     await msg.delete()
+
 # ===== Telegram Launcher =====
 def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
