@@ -71,16 +71,30 @@ async def download_and_send(update: Update, link: str):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    links = re.findall(r"(https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/\S+)", text)
+
+    # ✅ Match Terabox links across multiple lines, ignoring other links
+    links = re.findall(
+        r"(https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/[^\s\)\]\}]+)",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE
+    )
 
     if not links:
-        return await update.message.reply_text("❌ Please send a valid Terabox link.")
+        return await update.message.reply_text("❌ No valid Terabox link found in your message.")
 
-    await update.message.reply_text(f"🔍 Found {len(links)} link(s). Starting downloads...")
+    # 🧹 Remove duplicates
+    links = list(dict.fromkeys(links))
 
-    tasks = [asyncio.create_task(download_and_send(update, link)) for link in links]
+    await update.message.reply_text(f"🔍 Found {len(links)} Terabox link(s). Starting downloads...")
+
+    # Run downloads with concurrency limit
+    tasks = []
+    for link in links:
+        # Use semaphore to limit concurrent downloads
+        async with semaphore:
+            tasks.append(asyncio.create_task(download_and_send(update, link)))
+
     await asyncio.gather(*tasks)
-
 
 # ===== Telegram Launcher =====
 def run_bot():
