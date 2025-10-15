@@ -71,30 +71,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Normalize text
     clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
     clean_text = re.sub(r"\s+", " ", clean_text)
 
-    # Detect all links
-    links = re.findall(
-        r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+",
-        clean_text
-    )
-    links = list(dict.fromkeys(links))  # remove duplicates
+    links = list(dict.fromkeys(
+        re.findall(r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+", clean_text)
+    ))
 
     if not links:
         return
 
-    # Send ONE processing message
     msg = await update.message.reply_text(f"🔍 Found {len(links)} link(s). Starting downloads...")
 
     failed_links = []
-    # Process in batches to avoid overload
-    BATCH_SIZE = 15
-    for i in range(0, len(links), BATCH_SIZE):
-        batch = links[i:i+BATCH_SIZE]
-        tasks = [asyncio.create_task(download_and_send(update, link, failed_links)) for link in batch]
-        await asyncio.gather(*tasks)
+    tasks = [asyncio.create_task(download_and_send(update, link, failed_links)) for link in links]
+    await asyncio.gather(*tasks)
 
     if failed_links:
         await update.message.reply_text(
