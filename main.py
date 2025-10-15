@@ -5,10 +5,12 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+# ===== CONFIG =====
+BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"  # your bot token
 API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 CONCURRENT_DOWNLOADS = 15
+# ==================
 
 semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
 
@@ -19,13 +21,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📥 Send me Terabox link(s) and I'll download them.\n"
         "⚠️ Max file size: 2GB\n\n"
         "Available commands:\n"
-        "/start - Show this message\n"
-        "/help - Show commands info"
+        "/start - Show this message"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
 
 # ===== Download Function =====
 async def download_and_send(update: Update, link: str, failed_links: list):
@@ -86,11 +84,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"🔍 Found {len(links)} link(s). Starting downloads...")
 
     failed_links = []
-    # Run downloads concurrently with semaphore limiting
     tasks = [asyncio.create_task(download_and_send(update, link, failed_links)) for link in links]
     await asyncio.gather(*tasks)
 
-    # Send only failed links at the end
     if failed_links:
         await update.message.reply_text(
             "❌ Failed to download the following link(s):\n" + "\n".join(failed_links)
@@ -102,7 +98,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def run_bot():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("🚀 Bot is running...")
     app.run_polling()
+
+
+if __name__ == "__main__":
+    run_bot()
