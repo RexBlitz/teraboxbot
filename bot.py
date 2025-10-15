@@ -7,7 +7,7 @@ import os
 from threading import Thread
 
 # ========== CONFIG ==========
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU")  # Replace or use env var
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU")  
 API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
 # =============================
 
@@ -18,14 +18,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "👋 *Welcome to Terabox Downloader Bot!*\n\n"
-        "📥 Send me any Terabox link (e.g. https://terabox.com/s/xxxxxxx)\n"
+        "📥 Send me any Terabox link \n"
         "and I’ll give you:\n"
         "🎬 File name\n"
         "📦 Size\n"
         "👤 Uploader\n"
         "📥 Download link\n"
         "🎦 Streaming link\n\n"
-        "Powered by Robin's API"
+
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
