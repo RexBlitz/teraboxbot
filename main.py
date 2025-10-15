@@ -71,32 +71,45 @@ async def download_and_send(update: Update, link: str):
 
 
 
-async def handle_message(update, context):
-    # Get message text: either plain text or media caption
-    text = update.message.text or update.message.caption
-    if not text:
-        return  # Nothing to process
+import re
+import asyncio
 
-    # Normalize text (remove weird unicode/formatting)
+async def handle_message(update, context):
+    # Initialize empty text variable
+    text = None
+
+    # 1️⃣ Check plain text
+    if update.message.text:
+        text = update.message.text
+
+    # 2️⃣ Check media captions if text is empty
+    elif hasattr(update.message, "caption") and update.message.caption:
+        text = update.message.caption
+
+    # 3️⃣ Nothing to process
+    if not text:
+        return
+
+    # Normalize text: remove emojis / invisible chars and collapse spaces
     clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
     clean_text = re.sub(r"\s+", " ", clean_text)
 
-    # ✅ Regex to detect full Terabox /s/ links
+    # Regex: detect full Terabox /s/ links
     links = re.findall(
         r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+",
         clean_text
     )
 
     if not links:
-        return  # No Terabox link in this message
+        return  # No Terabox link detected
 
     # Remove duplicates
     links = list(dict.fromkeys(links))
 
-    # Optional: send "processing" message
+    # Optional: "processing" message
     msg = await update.message.reply_text(f"🔍 Found {len(links)} Terabox link(s). Starting downloads...")
 
-    # Download each link respecting concurrency
+    # Download links concurrently
     tasks = []
     for link in links:
         async with semaphore:
@@ -104,7 +117,7 @@ async def handle_message(update, context):
 
     await asyncio.gather(*tasks)
 
-    # Delete "processing" message after all downloads
+    # Delete "processing" message
     await msg.delete()
 # ===== Telegram Launcher =====
 def run_bot():
