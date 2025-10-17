@@ -13,7 +13,7 @@ from aiohttp import ClientPayloadError, ClientResponseError
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_TELEGRAM_SIZE = 2000 * 1024 * 1024  # 2GB
-CONCURRENT_DOWNLOADS = 10
+CONCURRENT_DOWNLOADS = 100
 RETRY_ATTEMPTS = 5
 RETRY_DELAY = 1
 # ==================
