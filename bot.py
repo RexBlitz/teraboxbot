@@ -13,7 +13,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
-MONGO_URI = "mongodb+srv://irexanon:<db_password>@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
+MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
 MAX_TELEGRAM_SIZE = 2000 * 1024 * 1024  # 2GB
 CONCURRENT_DOWNLOADS = 100
 RETRY_ATTEMPTS = 5
@@ -230,7 +230,7 @@ async def setup_bot_commands(application):
         BotCommand("autofetch", "Enable/disable auto link downloading"),
     ]
     await application.bot.set_my_commands(commands)
-    log.info("✅ Command menu set.")
+
 
 
 # ===== Run Bot =====
