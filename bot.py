@@ -4,7 +4,7 @@ import os
 import aiohttp
 import aiofiles
 import logging
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import hashlib
 from aiohttp import ClientPayloadError, ClientResponseError
@@ -46,6 +46,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Show this message"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# ===== Setup bot command menu =====
+async def setup_bot_commands(application):
+    commands = [
+        BotCommand("start", "Show start message and usage help"),
+    ]
+    await application.bot.set_my_commands(commands)
+    log.info("✅ Bot command menu set")
 
 
 # ===== Helper: fetch API info (with retries) =====
@@ -204,8 +213,15 @@ async def close_session_later(session):
 def run_bot():
     log.info("🚀 Starting Terabox Telegram Bot...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Setup bot command menu
+    async def post_init(app):
+        await setup_bot_commands(app)
+
+    app.post_init = post_init
     app.run_polling()
 
 
