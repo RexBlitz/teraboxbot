@@ -9,7 +9,7 @@ import hashlib
 
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
-API_BASE = "https://terabox-apii.pages.dev/api"
+API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB (not enforced due to missing Content-Length)
 CONCURRENT_DOWNLOADS = 50  # Increased for better performance
 RETRY_ATTEMPTS = 5  # Retry failed downloads
