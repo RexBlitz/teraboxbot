@@ -5,12 +5,15 @@ import aiohttp
 import aiofiles
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+import hashlib
 
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox-apii.pages.dev/api"
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
-CONCURRENT_DOWNLOADS = 15
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB (not enforced due to missing Content-Length)
+CONCURRENT_DOWNLOADS = 50  # Increased for better performance
+RETRY_ATTEMPTS = 5  # Retry failed downloads
+RETRY_DELAY = 1  # Seconds between retries
 # ==================
 semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
 
@@ -36,33 +39,46 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
                 failed_links.append(link)
                 return
 
+            failed_files = []
             for file in data["links"]:
                 filename = file["name"]
                 download_url = file["download_url"]
                 caption = ""  # Empty caption as requested
 
-                # Check file size using HEAD request
-                async with session.head(download_url) as head_resp:
-                    size_bytes = int(head_resp.headers.get("Content-Length", 0))
-                    if size_bytes > MAX_FILE_SIZE:
-                        failed_links.append(link)
-                        continue
+                for attempt in range(RETRY_ATTEMPTS):
+                    try:
+                        # Download file to disk
+                        file_path = f"/tmp/{hashlib.md5(download_url.encode()).hexdigest()}_{filename}"
+                        async with session.get(download_url, timeout=300) as r:
+                            r.raise_for_status()
+                            async with aiofiles.open(file_path, "wb") as f:
+                                async for chunk in r.content.iter_chunked(8192):
+                                    await f.write(chunk)
 
-                # Download file asynchronously
-                file_path = f"/tmp/{filename}"
-                async with session.get(download_url) as r:
-                    r.raise_for_status()
-                    async with aiofiles.open(file_path, "wb") as f:
-                        async for chunk in r.content.iter_chunked(8192):
-                            await f.write(chunk)
+                        # Send file based on type
+                        if filename.lower().endswith(('.mp4', '.mkv', '.avi')):
+                            await update.message.reply_video(
+                                video=open(file_path, "rb"),
+                                caption=caption,
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            await update.message.reply_document(
+                                document=open(file_path, "rb"),
+                                caption=caption,
+                                parse_mode="Markdown"
+                            )
+                        os.remove(file_path)
+                        break  # Success, exit retry loop
+                    except Exception as e:
+                        if attempt < RETRY_ATTEMPTS - 1:
+                            await asyncio.sleep(RETRY_DELAY)
+                            continue
+                        failed_files.append(filename)
+                        break
 
-                # Send video
-                await update.message.reply_video(
-                    video=open(file_path, "rb"),
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
-                os.remove(file_path)
+            if failed_files:
+                failed_links.append(f"{link} (failed files: {', '.join(failed_files)})")
         except Exception:
             failed_links.append(link)
 
