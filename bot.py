@@ -13,9 +13,9 @@ from aiohttp import ClientPayloadError, ClientResponseError
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_TELEGRAM_SIZE = 2000 * 1024 * 1024  # 2GB
-CONCURRENT_DOWNLOADS = 100
+CONCURRENT_DOWNLOADS = 15  # Reduced from 100 to avoid overwhelming servers
 RETRY_ATTEMPTS = 5
-RETRY_DELAY = 1
+RETRY_DELAY = 2  # Increased from 1 second
 # ==================
 
 # ===== Logging Setup =====
@@ -88,7 +88,7 @@ async def fetch_api_info(session: aiohttp.ClientSession, link: str):
             last_exc = e
             log.warning(f"API fetch failed for {link}: {e}")
             if attempt < RETRY_ATTEMPTS - 1:
-                await asyncio.sleep(RETRY_DELAY)
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
             else:
                 raise last_exc
 
@@ -129,8 +129,8 @@ async def download_file(update: Update, link: str, file_info: dict, session: aio
         except (ClientPayloadError, ClientResponseError, asyncio.TimeoutError, ValueError) as e:
             log.warning(f"Download failed for {filename}: {e}")
             if attempt < RETRY_ATTEMPTS - 1:
-                log.info(f"Refreshing API info and retrying in {RETRY_DELAY}s...")
-                await asyncio.sleep(RETRY_DELAY)
+                log.info(f"Refreshing API info and retrying in {RETRY_DELAY * (attempt + 1)}s...")
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
                 try:
                     data = await fetch_api_info(session, link)
                     fresh_file = next((f for f in data.get("links", []) if f["name"] == filename), None)
@@ -142,21 +142,25 @@ async def download_file(update: Update, link: str, file_info: dict, session: aio
                 except Exception as e2:
                     log.warning(f"Failed to refresh API info: {e2}")
             else:
-                await update.message.reply_text(f"❌ Failed to download {filename} after multiple attempts")
+                await update.message.reply_text(
+                    f"❌ Failed to download *{filename}* after multiple attempts",
+                    parse_mode="Markdown"
+                )
                 return
 
     # Send to Telegram
     try:
         log.info(f"📤 Uploading {filename} to Telegram")
-        if filename.lower().endswith(('.mp4', '.mkv', '.avi')):
-            await update.message.reply_video(video=open(file_path, "rb"))
-        else:
-            await update.message.reply_document(document=open(file_path, "rb"))
+        with open(file_path, "rb") as file:
+            if filename.lower().endswith(('.mp4', '.mkv', '.avi')):
+                await update.message.reply_video(video=file)
+            else:
+                await update.message.reply_document(document=file)
         log.info(f"✅ Uploaded {filename} to Telegram")
     except Exception as e:
         log.error(f"Upload failed for {filename}: {e}")
         await update.message.reply_text(
-            f"⚠️ Upload failed for {filename}: {e}\n"
+            f"⚠️ Upload failed for *{filename}*\n"
             f"👉 [Download Link]({download_url})",
             parse_mode="Markdown"
         )
@@ -179,29 +183,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     log.info(f"🧾 User {update.effective_user.id} sent {len(links)} link(s)")
-    await update.message.reply_text(f"🔍 Found {len(links)} Terabox link(s). Processing in background...")
+    status_msg = await update.message.reply_text(
+        f"🔍 Found {len(links)} Terabox link(s). Processing..."
+    )
 
-    session = aiohttp.ClientSession()
+    failed_links = []
+    
+    async with aiohttp.ClientSession() as session:
+        async def run_task(link):
+            async with semaphore:
+                try:
+                    data = await fetch_api_info(session, link)
+                    for file_info in data.get("links", []):
+                        await download_file(update, link, file_info, session)
+                except Exception as e:
+                    log.error(f"Task failed for {link}: {e}")
+                    failed_links.append(link)
 
-    async def run_task(link):
-        try:
-            data = await fetch_api_info(session, link)
-            for file_info in data.get("links", []):
-                await download_file(update, link, file_info, session)
-        except Exception as e:
-            log.error(f"Task failed for {link}: {e}")
-            await update.message.reply_text(f"⚠️ Error processing link: {str(e)[:200]}")
+        tasks = [asyncio.create_task(run_task(link)) for link in links]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    for link in links:
-        asyncio.create_task(run_task(link))
-
-    asyncio.create_task(close_session_later(session))
-
-async def close_session_later(session):
-    await asyncio.sleep(600)
-    if not session.closed:
-        await session.close()
-        log.info("🧾 Closed aiohttp session after idle timeout.")
+    # Send failed links report
+    if failed_links:
+        failed_text = "❌ Failed to process the following link(s):\n" + "\n".join(failed_links)
+        await update.message.reply_text(failed_text)
+    
+    # Delete status message
+    try:
+        await status_msg.delete()
+    except:
+        pass
 
 # ===== Bot Launcher =====
 def run_bot():
