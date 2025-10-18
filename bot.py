@@ -79,14 +79,14 @@ async def fetch_api_info(session: aiohttp.ClientSession, link: str):
     for attempt in range(RETRY_ATTEMPTS):
         try:
             log.info(f"🔍 API: fetching file info for {link} (attempt {attempt+1})")
-            timeout = aiohttp.ClientTimeout(total=60, connect=30)
-            async with session.get(f"{API_BASE}?url={link}", timeout=timeout, allow_redirects=True) as resp:
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with session.get(f"{API_BASE}?url={link}", timeout=timeout) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
             if not data.get("links"):
                 raise ValueError("API returned no links")
             return data
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except Exception as e:
             last_exc = e
             log.warning(f"API fetch failed for {link}: {e}")
             if attempt < RETRY_ATTEMPTS - 1:
@@ -97,14 +97,10 @@ async def fetch_api_info(session: aiohttp.ClientSession, link: str):
 # ===== Helper: download URL to file with parallel chunks =====
 async def download_chunk(session: aiohttp.ClientSession, url: str, start: int, end: int, file_path: str, chunk_index: int):
     """Download a specific chunk of the file"""
-    headers = {
-        'Range': f'bytes={start}-{end}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://www.terabox.app/',
-    }
-    timeout = aiohttp.ClientTimeout(total=900, connect=30)
+    headers = {'Range': f'bytes={start}-{end}'}
+    timeout = aiohttp.ClientTimeout(total=900)
     
-    async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as r:
+    async with session.get(url, headers=headers, timeout=timeout) as r:
         if r.status not in (200, 206):
             raise Exception(f"Failed to download chunk {chunk_index}")
         
@@ -117,26 +113,17 @@ async def download_chunk(session: aiohttp.ClientSession, url: str, start: int, e
 
 async def try_download_url(session: aiohttp.ClientSession, url: str, file_path: str):
     """Download file with parallel chunks for maximum speed"""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://www.terabox.app/',
-    }
-    timeout = aiohttp.ClientTimeout(total=60, connect=30)
+    timeout = aiohttp.ClientTimeout(total=60)
     
     # Get file size to enable parallel downloads
-    try:
-        async with session.head(url, headers=headers, timeout=timeout, allow_redirects=True) as r:
-            file_size = int(r.headers.get('Content-Length', 0))
-            accepts_ranges = r.headers.get('Accept-Ranges') == 'bytes'
-    except:
-        # If HEAD fails, fallback to GET
-        file_size = 0
-        accepts_ranges = False
+    async with session.head(url, timeout=timeout) as r:
+        file_size = int(r.headers.get('Content-Length', 0))
+        accepts_ranges = r.headers.get('Accept-Ranges') == 'bytes'
     
     # If server doesn't support ranges or file is small, download normally
     if not accepts_ranges or file_size < 10 * 1024 * 1024:  # Less than 10MB
-        timeout = aiohttp.ClientTimeout(total=900, connect=30)
-        async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as r:
+        timeout = aiohttp.ClientTimeout(total=900)
+        async with session.get(url, timeout=timeout) as r:
             r.raise_for_status()
             async with aiofiles.open(file_path, "wb") as f:
                 async for chunk in r.content.iter_chunked(65536):
