@@ -4,345 +4,475 @@ import os
 import aiohttp
 import aiofiles
 import logging
-import urllib.parse
-from telegram import Update, BotCommand
+from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import hashlib
-from motor.motor_asyncio import AsyncIOMotorClient
-from aiohttp import ClientPayloadError, ClientResponseError
+from pymongo import MongoClient
+from datetime import datetime
 
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
-MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
-MAX_TELEGRAM_SIZE = 2000 * 1024 * 1024  # 2GB
-CONCURRENT_DOWNLOADS = 100
-RETRY_ATTEMPTS = 5
-RETRY_DELAY = 1
+MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+MAX_CONCURRENT_LINKS = 50          # Max links processed at once
+CHUNK_SIZE = 1024 * 1024           # 1MB chunks (optimal for high-speed I/O)
+TIMEOUT = 120                      # Seconds
 # ==================
 
-# ===== Logging Setup =====
+# ===== MONGODB CONFIG =====
+MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
+DB_NAME = "terabox_bot"
+DOWNLOADS_COLLECTION = "downloads"
+FAILED_LINKS_COLLECTION = "failed_links"
+# ==========================
+
+# ===== BROADCAST CONFIG =====
+BROADCAST_CHATS = [
+    -1002780909369,
+]
+# ============================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S"
 )
 log = logging.getLogger("TeraboxBot")
-
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.client").setLevel(logging.WARNING)
-logging.getLogger("telegram.vendor.ptb_urllib3.urllib3").setLevel(logging.WARNING)
 
-semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
+# Global session
+SESSION = None
+LINK_SEM = asyncio.Semaphore(MAX_CONCURRENT_LINKS)
 
-# ===== MongoDB Setup =====
-mongo_client = AsyncIOMotorClient(MONGO_URI)
-db = mongo_client["terabox"]
-chats_col = db["terabox_chats"]
+LINK_REGEX = re.compile(
+    r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink)\.[^\s]+",
+    re.IGNORECASE
+)
 
-# ===== Database Helpers =====
-async def get_chat_config(chat_id: int):
-    doc = await chats_col.find_one({"_id": chat_id})
-    if not doc:
-        is_private = chat_id > 0  # Positive chat_id indicates private chat
-        doc = {"_id": chat_id, "source_chat": None, "target_chat": None, "auto_fetch": is_private}
-        await chats_col.insert_one(doc)
-    return doc
 
-async def update_chat_config(chat_id: int, data: dict):
-    await chats_col.update_one({"_id": chat_id}, {"$set": data}, upsert=True)
+class MongoDBManager:
+    def __init__(self):
+        self.client = MongoClient(MONGO_URI)
+        self.db = self.client[DB_NAME]
+        self.downloads = self.db[DOWNLOADS_COLLECTION]
+        self.failed_links = self.db[FAILED_LINKS_COLLECTION]
+        self._create_indexes()
 
-# ===== Commands =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 *Terabox Downloader Bot*\n\n"
-        "📥 Send Terabox links in private chat or set a source channel.\n"
-        "⚠️ Max upload size: 2GB (Telegram limit)\n\n"
-        "Commands:\n"
-        "/start - Show this message\n"
-        "/setsource <chat_id> - Set source channel for links\n"
-        "/settarget <chat_id> - Set target chat for files\n"
-        "/autofetch on|off - Enable/disable auto-fetch for source channel\n"
-        "/fetch [count|all] - Fetch links from source channel\n"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    def _create_indexes(self):
+        """Create indexes for faster queries"""
+        self.downloads.create_index("timestamp")
+        self.downloads.create_index("user_id")
+        self.failed_links.create_index("timestamp")
+        self.failed_links.create_index("user_id")
+        self.failed_links.create_index("retry_count")
 
-async def set_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: `/setsource <chat_id>`", parse_mode="Markdown")
-    
-    try:
-        source_chat = int(context.args[0])
-        await update_chat_config(update.effective_chat.id, {"source_chat": source_chat})
-        await update.message.reply_text(f"🎯 Source channel set to `{source_chat}`", parse_mode="Markdown")
-        log.info(f"🧾 Source channel set to {source_chat}")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid chat ID", parse_mode="Markdown")
-
-async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: `/settarget <chat_id>`", parse_mode="Markdown")
-    
-    try:
-        target_chat = int(context.args[0])
-        await update_chat_config(update.effective_chat.id, {"target_chat": target_chat})
-        await update.message.reply_text(f"🎯 Target chat set to `{target_chat}`", parse_mode="Markdown")
-        log.info(f"🧾 Target chat set to {target_chat}")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid chat ID", parse_mode="Markdown")
-
-async def auto_fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Usage: `/autofetch on|off`", parse_mode="Markdown")
-
-    chat_cfg = await get_chat_config(update.effective_chat.id)
-    if not chat_cfg.get("source_chat"):
-        return await update.message.reply_text("❌ Set a source channel first with `/setsource <chat_id>`", parse_mode="Markdown")
-
-    choice = context.args[0].lower()
-    enabled = choice == "on"
-    await update_chat_config(update.effective_chat.id, {"auto_fetch": enabled})
-    msg = f"✅ Auto-fetch enabled for source channel `{chat_cfg['source_chat']}`." if enabled else f"⛔ Auto-fetch disabled for source channel `{chat_cfg['source_chat']}`."
-    await update.message.reply_text(msg, parse_mode="Markdown")
-    log.info(f"🧾 Auto-fetch set to {enabled} for source channel {chat_cfg['source_chat']}")
-
-async def fetch_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_cfg = await get_chat_config(update.effective_chat.id)
-    source_chat = chat_cfg.get("source_chat")
-    if not source_chat:
-        return await update.message.reply_text("❌ Set a source channel first with `/setsource <chat_id>`", parse_mode="Markdown")
-
-    count_arg = context.args[0] if context.args else "5"
-    count = None if count_arg.lower() == "all" else int(count_arg)
-
-    try:
-        messages = await context.bot.get_chat_history(chat_id=source_chat, limit=count)
-        links = []
-        for msg in messages:
-            text = msg.text or getattr(msg, "caption", None)
-            if text:
-                links.extend(extract_links(text))
-        links = list(dict.fromkeys(links))  # Remove duplicates
-
-        if not links:
-            return await update.message.reply_text("❌ No Terabox links found in source channel.")
-
-        send_chat_id = chat_cfg.get("target_chat") or update.effective_chat.id
-        await update.message.reply_text(f"🔍 Found {len(links)} link(s). Processing in background...")
-        log.info(f"🧾 User {update.effective_user.id} sent {len(links)} link(s)")
-
-        async with semaphore:
-            session = aiohttp.ClientSession()
-            try:
-                for link in links:
-                    asyncio.create_task(run_task(context.bot, link, session, send_chat_id, update.effective_chat.id))
-            finally:
-                asyncio.create_task(close_session_later(session))
-    except Exception as e:
-        log.error(f"Task failed for fetch command: {e}")
-        await update.message.reply_text(f"❌ Error fetching history: {e}", parse_mode="Markdown")
-
-# ===== Helpers =====
-async def fetch_api_info(session: aiohttp.ClientSession, link: str):
-    encoded_link = urllib.parse.quote(link, safe='')
-    url = f"{API_BASE}?url={encoded_link}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    last_exc = None
-    for attempt in range(RETRY_ATTEMPTS):
+    def record_success(self, user_id: int, link: str, file_name: str, file_size: int, video_link: str = None):
+        """Record successful download"""
         try:
-            log.info(f"🔍 API: fetching file info for {link} (attempt {attempt+1})")
-            timeout = aiohttp.ClientTimeout(total=60)
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                if not data.get("links"):
-                    raise ValueError("API returned no links")
-                return data
+            record = {
+                "user_id": user_id,
+                "original_link": link,
+                "file_name": file_name,
+                "file_size": file_size,
+                "video_link": video_link,
+                "timestamp": datetime.utcnow(),
+                "status": "success"
+            }
+            result = self.downloads.insert_one(record)
+            log.info(f"✅ Recorded success: {file_name}")
+            return result.inserted_id
         except Exception as e:
-            last_exc = e
-            log.warning(f"API fetch failed for {link}: {e}")
-            if attempt < RETRY_ATTEMPTS - 1:
-                await asyncio.sleep(RETRY_DELAY)
+            log.error(f"❌ Failed to record success: {e}")
+
+    def record_failure(self, user_id: int, link: str, error: str):
+        """Record failed download"""
+        try:
+            existing = self.failed_links.find_one({
+                "original_link": link,
+                "user_id": user_id
+            })
+            
+            if existing:
+                self.failed_links.update_one(
+                    {"_id": existing["_id"]},
+                    {
+                        "$inc": {"retry_count": 1},
+                        "$set": {"last_error": error, "last_attempt": datetime.utcnow()}
+                    }
+                )
             else:
-                raise last_exc
+                record = {
+                    "user_id": user_id,
+                    "original_link": link,
+                    "error": error,
+                    "last_error": error,
+                    "retry_count": 1,
+                    "timestamp": datetime.utcnow(),
+                    "last_attempt": datetime.utcnow(),
+                    "status": "failed"
+                }
+                self.failed_links.insert_one(record)
+            
+            log.info(f"❌ Recorded failure: {link}")
+        except Exception as e:
+            log.error(f"❌ Failed to record failure: {e}")
 
-async def try_download_url(session: aiohttp.ClientSession, url: str, file_path: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    timeout = aiohttp.ClientTimeout(total=1200)  # 20 minutes for large files
-    async with session.get(url, headers=headers, timeout=timeout) as r:
-        r.raise_for_status()
-        async with aiofiles.open(file_path, "wb") as f:
-            async for chunk in r.content.iter_chunked(8192):
-                if not chunk:
-                    log.debug(f"Received empty chunk for {file_path}")
-                    continue
-                await f.write(chunk)
+    def get_stats(self, user_id: int = None):
+        """Get download statistics"""
+        try:
+            query = {"user_id": user_id} if user_id else {}
+            
+            total_success = self.downloads.count_documents(query)
+            total_failed = self.failed_links.count_documents(query)
+            
+            total_size = 0
+            for doc in self.downloads.find(query):
+                total_size += doc.get("file_size", 0)
+            
+            return {
+                "total_success": total_success,
+                "total_failed": total_failed,
+                "total_size_gb": round(total_size / (1024**3), 2),
+                "total_size_bytes": total_size
+            }
+        except Exception as e:
+            log.error(f"❌ Failed to get stats: {e}")
+            return None
 
-async def download_file_with_refresh(bot, link: str, file_info: dict, session: aiohttp.ClientSession, send_chat_id: int, user_chat_id: int):
-    filename = file_info["name"]
-    size_mb = file_info.get("size_mb", 0)
-    download_url = file_info.get("download_url")
-    original_url = file_info.get("original_url")
+    def get_failed_links(self, user_id: int = None, limit: int = 10):
+        """Get list of failed links"""
+        try:
+            query = {"user_id": user_id} if user_id else {}
+            failed = list(self.failed_links.find(query).sort("last_attempt", -1).limit(limit))
+            return failed
+        except Exception as e:
+            log.error(f"❌ Failed to get failed links: {e}")
+            return []
 
-    if size_mb * 1024 * 1024 > MAX_TELEGRAM_SIZE:
-        log.warning(f"File too large for Telegram ({size_mb:.2f} MB): {filename}")
-        await bot.send_message(
-            send_chat_id,
-            f"⚠️ *{filename}* is too large ({size_mb:.2f} MB).\n"
-            f"👉 [Download Link]({download_url or original_url})",
-            parse_mode="Markdown"
+    def retry_failed_link(self, link_id: str):
+        """Mark failed link for retry"""
+        try:
+            from bson.objectid import ObjectId
+            self.failed_links.update_one(
+                {"_id": ObjectId(link_id)},
+                {"$set": {"retry_requested": True, "retry_requested_at": datetime.utcnow()}}
+            )
+            log.info(f"🔄 Marked for retry: {link_id}")
+            return True
+        except Exception as e:
+            log.error(f"❌ Failed to mark retry: {e}")
+            return False
+
+
+# Initialize MongoDB
+try:
+    db_manager = MongoDBManager()
+    log.info("✅ MongoDB connected")
+except Exception as e:
+    log.error(f"❌ MongoDB connection failed: {e}")
+    db_manager = None
+
+
+async def get_session():
+    global SESSION
+    if SESSION is None or SESSION.closed:
+        import ssl
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(
+            limit=200,
+            limit_per_host=50,
+            ssl=ssl_ctx,
+            ttl_dns_cache=300,
+            use_dns_cache=True
         )
+        SESSION = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+        )
+    return SESSION
+
+
+async def download_file(url: str, path: str, session: aiohttp.ClientSession):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://www.terabox.app/'
+    }
+    async with session.get(url, headers=headers, ssl=False) as r:
+        r.raise_for_status()
+        total = int(r.headers.get('Content-Length', 0))
+        async with aiofiles.open(path, 'wb') as f:
+            async for chunk in r.content.iter_chunked(CHUNK_SIZE):
+                if chunk:
+                    await f.write(chunk)
+        if total > 0:
+            actual = os.path.getsize(path)
+            if actual < total:
+                raise RuntimeError(f"Incomplete download: {actual}/{total}")
+
+
+async def broadcast_video(file_path: str, video_name: str, update: Update):
+    """Broadcasts downloaded video to all preset chats"""
+    if not BROADCAST_CHATS:
+        log.warning("No broadcast chats configured")
         return
 
-    file_hash = hashlib.md5((download_url or original_url).encode()).hexdigest()
-    file_path = f"/tmp/{file_hash}_{filename}"
+    if not video_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+        return
 
-    for attempt in range(RETRY_ATTEMPTS):
+    broadcast_count = 0
+    for chat_id in BROADCAST_CHATS:
         try:
-            log.info(f"⬇️ Downloading {filename} (attempt {attempt+1})")
-            try:
-                if download_url:
-                    await try_download_url(session, download_url, file_path)
-                else:
-                    raise ValueError("No download_url available")
-            except Exception as e:
-                log.warning(f"Download URL failed: {e}")
-                if original_url:
-                    log.info(f"Trying original_url for {filename}")
-                    await try_download_url(session, original_url, file_path)
-                else:
-                    raise
-            log.info(f"✅ Downloaded {filename}")
-            break
-        except (ClientPayloadError, ClientResponseError, asyncio.TimeoutError, ValueError) as e:
-            log.warning(f"Download failed for {filename}: {e}")
-            if attempt < RETRY_ATTEMPTS - 1:
-                log.info(f"Refreshing download URL and retrying in {RETRY_DELAY}s...")
-                try:
-                    data = await fetch_api_info(session, link)
-                    fresh_file = next((f for f in data["links"] if f["name"] == filename), None)
-                    if fresh_file:
-                        download_url = fresh_file.get("download_url")
-                        original_url = fresh_file.get("original_url")
-                except Exception as e2:
-                    log.warning(f"Failed to refresh URL: {e2}")
-                await asyncio.sleep(RETRY_DELAY)
-            else:
-                await bot.send_message(
-                    user_chat_id,
-                    f"❌ Failed to download {filename} after multiple attempts",
-                    parse_mode="Markdown"
+            with open(file_path, 'rb') as f:
+                await update.get_bot().send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    caption=f"📥 Shared: {video_name}",
+                    supports_streaming=True
                 )
-                return
+            log.info(f"📤 Broadcasted {video_name} to chat {chat_id}")
+            broadcast_count += 1
+        except Exception as e:
+            log.error(f"❌ Broadcast failed for chat {chat_id}: {str(e)[:100]}")
+
+    if broadcast_count > 0:
+        log.info(f"✅ Broadcast complete: {broadcast_count}/{len(BROADCAST_CHATS)} chats")
+
+
+async def upload_and_cleanup(update: Update, path: str, name: str, link: str, size: int):
+    try:
+        with open(path, 'rb') as f:
+            is_video = name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
+            if is_video:
+                await update.message.reply_video(video=f, supports_streaming=True)
+            else:
+                await update.message.reply_document(document=f)
+        
+        # Record success in MongoDB
+        if db_manager:
+            db_manager.record_success(
+                user_id=update.effective_user.id,
+                link=link,
+                file_name=name,
+                file_size=size,
+                video_link=path
+            )
+        
+        # Broadcast video to other chats
+        if is_video:
+            asyncio.create_task(broadcast_video(path, name, update))
+    
+    finally:
+        await asyncio.sleep(2)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def process_single_file(update: Update, file_info: dict, original_link: str):
+    name = file_info.get('name', 'unknown')
+    size = file_info.get('size', 0)  # in bytes
+    url = file_info.get('original_url')
+
+    if not url:
+        await update.message.reply_text(f"❌ No download URL for: {name}")
+        if db_manager:
+            db_manager.record_failure(update.effective_user.id, original_link, "No download URL")
+        return
+
+    if size > MAX_SIZE:
+        await update.message.reply_text(f"❌ Skipped (too large >2GB): {name}")
+        if db_manager:
+            db_manager.record_failure(update.effective_user.id, original_link, "File too large >2GB")
+        return
+
+    # Use RAM disk for temp files (faster!)
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+    path = f"/dev/shm/terabox_{hashlib.md5(url.encode()).hexdigest()}_{safe_name}"
 
     try:
-        log.info(f"📤 Uploading {filename} to Telegram")
-        if filename.lower().endswith(('.mp4', '.mkv', '.avi')):
-            await bot.send_video(chat_id=send_chat_id, video=open(file_path, "rb"))
-        else:
-            await bot.send_document(chat_id=send_chat_id, document=open(file_path, "rb"))
-        log.info(f"✅ Uploaded {filename} to Telegram")
+        session = await get_session()
+        log.info(f"⬇️ {name} ({size / 1e6:.1f} MB)")
+        await download_file(url, path, session)
+        log.info(f"✅ Downloaded: {name}")
+        await upload_and_cleanup(update, path, name, original_link, size)
     except Exception as e:
-        log.error(f"Upload failed for {filename}: {e}")
-        await bot.send_message(
-            user_chat_id,
-            f"⚠️ Upload failed for {filename}: {e}\n"
-            f"👉 [Download Link]({download_url or original_url})",
-            parse_mode="Markdown"
-        )
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            log.debug(f"🧹 Deleted temp file: {file_path}")
+        error_msg = f"❌ Failed: {name} – {str(e)[:120]}"
+        log.error(error_msg)
+        if db_manager:
+            db_manager.record_failure(update.effective_user.id, original_link, str(e)[:200])
+        try:
+            await update.message.reply_text(error_msg)
+        except:
+            pass
+        # Cleanup on failure
+        if os.path.exists(path):
+            os.remove(path)
 
-def extract_links(text: str):
-    clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
-    clean_text = re.sub(r"\s+", " ", clean_text)
-    return list(dict.fromkeys(
-        re.findall(r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+", clean_text)
-    ))
 
-# ===== Message Handler =====
+async def process_link_independently(update: Update, link: str):
+    async with LINK_SEM:
+        try:
+            session = await get_session()
+            async with session.get(f"{API_BASE}?url={link}", ssl=False) as r:
+                if r.status != 200:
+                    raise Exception(f"API returned {r.status}")
+                data = await r.json()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Invalid link or API error: {link[:60]}...")
+            log.error(f"Link fetch failed: {e}")
+            if db_manager:
+                db_manager.record_failure(update.effective_user.id, link, str(e)[:200])
+            return
+
+        files = data.get('links', [])
+        if not files:
+            await update.message.reply_text("⚠️ No files found in the link.")
+            if db_manager:
+                db_manager.record_failure(update.effective_user.id, link, "No files found")
+            return
+
+        log.info(f"📦 {len(files)} file(s) from {link}")
+
+        # Process files one by one (Terabox is per-file limited)
+        for file_info in files:
+            await process_single_file(update, file_info, link)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or getattr(update.message, "caption", None)
+    text = update.message.text or update.message.caption
     if not text:
         return
 
-    links = extract_links(text)
-    log.info(f"🧾 User {update.effective_user.id} sent {len(links)} link(s)")
+    links = list(dict.fromkeys(LINK_REGEX.findall(text)))
     if not links:
         return
 
-    current_chat_id = update.effective_chat.id
-    chat_cfg = await get_chat_config(current_chat_id)
-    is_private = current_chat_id > 0
-    is_source_chat = chat_cfg.get("source_chat") == current_chat_id
-    should_process = is_private or (is_source_chat and chat_cfg.get("auto_fetch", False))
+    user_id = update.effective_user.id
+    log.info(f"🔗 {len(links)} link(s) from user {user_id}")
 
-    if not should_process:
+    if len(links) == 1:
+        await update.message.reply_text("🚀 Processing your Terabox link...")
+    else:
+        await update.message.reply_text(f"🚀 Processing {len(links)} Terabox links...")
+
+    for link in links:
+        asyncio.create_task(process_link_independently(update, link))
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show download statistics"""
+    if not db_manager:
+        await update.message.reply_text("❌ Database not connected")
         return
 
-    send_chat_id = chat_cfg.get("target_chat") or update.effective_chat.id
-    await update.message.reply_text(f"🔍 Found {len(links)} link(s). Processing in background...")
+    user_id = update.effective_user.id
+    stats = db_manager.get_stats(user_id)
+    
+    if not stats:
+        await update.message.reply_text("❌ Could not retrieve stats")
+        return
 
-    async with semaphore:
-        session = aiohttp.ClientSession()
-        try:
-            for link in links:
-                asyncio.create_task(run_task(context.bot, link, session, send_chat_id, update.effective_chat.id))
-        finally:
-            asyncio.create_task(close_session_later(session))
+    message = (
+        f"📊 *Your Download Stats*\n\n"
+        f"✅ Successful: `{stats['total_success']}`\n"
+        f"❌ Failed: `{stats['total_failed']}`\n"
+    )
+    await update.message.reply_text(message, parse_mode="Markdown")
 
-async def run_task(bot, link, session, send_chat_id, user_chat_id):
-    async with semaphore:
-        try:
-            data = await fetch_api_info(session, link)
-            for file_info in data["links"]:
-                await download_file_with_refresh(bot, link, file_info, session, send_chat_id, user_chat_id)
-        except Exception as e:
-            log.error(f"Task failed for {link}: {e}")
-            await bot.send_message(user_chat_id, f"⚠️ Error: {e}", parse_mode="Markdown")
 
-async def close_session_later(session):
-    await asyncio.sleep(600)
-    if not session.closed:
-        await session.close()
-        log.info("🧾 Closed aiohttp session after idle timeout.")
+async def failed_links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show failed links with optional count parameter"""
+    if not db_manager:
+        await update.message.reply_text("❌ Database not connected")
+        return
 
-# ===== Setup Bot Commands =====
-async def setup_bot_commands(application):
-    commands = [
-        BotCommand("start", "Show start message and usage help"),
-        BotCommand("setsource", "Set source channel for links"),
-        BotCommand("settarget", "Set target chat for files"),
-        BotCommand("autofetch", "Enable/disable auto-fetch for source channel"),
-        BotCommand("fetch", "Fetch links from source channel"),
-    ]
-    await application.bot.set_my_commands(commands)
-    log.info("✅ Bot command menu set")
+    user_id = update.effective_user.id
+    
+    # Get count from command args, default to 10
+    limit = 10
+    if context.args and context.args[0].isdigit():
+        limit = min(int(context.args[0]), 100)  # Max 100 to prevent spam
+    
+    failed = db_manager.get_failed_links(user_id, limit=limit)
+    
+    if not failed:
+        await update.message.reply_text("✅ No failed links!")
+        return
 
-# ===== Bot Launcher =====
-def run_bot():
-    log.info("🚀 Starting Terabox Telegram Bot...")
+    message = f"❌ *Failed Links (Last {len(failed)})*\n\n"
+    for idx, item in enumerate(failed, 1):
+        retries = item.get('retry_count', 1)
+        link_preview = item['original_link'][:50] + "..." if len(item['original_link']) > 50 else item['original_link']
+        message += f"{idx}. `{link_preview}`\n   Retries: {retries}\n"
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
+async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retry failed links"""
+    if not db_manager:
+        await update.message.reply_text("❌ Database not connected")
+        return
+
+    user_id = update.effective_user.id
+    failed = db_manager.get_failed_links(user_id, limit=50)
+    
+    if not failed:
+        await update.message.reply_text("✅ No failed links to retry!")
+        return
+
+    retry_count = 0
+    for item in failed:
+        link = item['original_link']
+        db_manager.retry_failed_link(str(item['_id']))
+        asyncio.create_task(process_link_independently(update, link))
+        retry_count += 1
+
+    await update.message.reply_text(f"🔄 Retrying {retry_count} failed link(s)...", parse_mode="Markdown")
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚡ *Ultra-Fast Terabox Bot*\n\n"
+        "📥 Send any Terabox link(s)!\n",
+        parse_mode="Markdown"
+    )
+
+
+def main():
+    log.info("🚀 Terabox Bot Starting (Optimized for High-Speed Server)...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("setsource", set_source))
-    app.add_handler(CommandHandler("settarget", set_target))
-    app.add_handler(CommandHandler("autofetch", auto_fetch))
-    app.add_handler(CommandHandler("fetch", fetch_links))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("failed", failed_links_command))
+    app.add_handler(CommandHandler("retry", retry_command))
+    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
 
-    async def post_init(app):
-        await setup_bot_commands(app)
-    app.post_init = post_init
-    app.run_polling()
+    async def set_commands(app):
+        """Set up command menu"""
+        from telegram import BotCommand
+        commands = [
+            BotCommand("start", "Start the bot"),
+            BotCommand("stats", "View your download stats"),
+            BotCommand("failed", "Show failed links (optional: /failed 20)"),
+            BotCommand("retry", "Retry all failed links"),
+        ]
+        await app.bot.set_my_commands(commands)
+
+    async def cleanup(app):
+        global SESSION
+        if SESSION and not SESSION.closed:
+            await SESSION.close()
+    
+    app.post_init = set_commands
+    app.post_shutdown = cleanup
+
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
-    run_bot()
+    main()
