@@ -13,11 +13,13 @@ from aiohttp import ClientPayloadError, ClientResponseError
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_TELEGRAM_SIZE = 2000 * 1024 * 1024  # 2GB
-CONCURRENT_DOWNLOADS = 15  # Reduced from 100 to avoid overwhelming servers
-RETRY_ATTEMPTS = 5
-RETRY_DELAY = 2  # Increased from 1 second
-CHUNK_SIZE = 65536  # 64KB chunks for faster I/O
-MAX_CONNECTIONS = 50  # Increased connection pool
+CONCURRENT_DOWNLOADS = 100  # 100 parallel downloads (your server can handle it!)
+CONCURRENT_UPLOADS = 30     # Telegram rate limit is the bottleneck
+RETRY_ATTEMPTS = 3          # Reduced retries (faster failure)
+RETRY_DELAY = 1             # Faster retry
+CHUNK_SIZE = 131072         # 128KB chunks (2x faster on fast network)
+MAX_CONNECTIONS = 200       # Increased for 100 concurrent
+DOWNLOAD_TIMEOUT = 600      # 10 minutes per file
 # ==================
 
 # ===== Logging Setup =====
@@ -36,6 +38,7 @@ logging.getLogger("telegram.client").setLevel(logging.WARNING)
 logging.getLogger("telegram.vendor.ptb_urllib3.urllib3").setLevel(logging.WARNING)
 
 semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
+upload_semaphore = asyncio.Semaphore(CONCURRENT_UPLOADS)  # Separate semaphore for uploads
 
 # ===== Terabox Link Regex =====
 TERABOX_REGEX = re.compile(
@@ -79,14 +82,14 @@ async def fetch_api_info(session: aiohttp.ClientSession, link: str):
     for attempt in range(RETRY_ATTEMPTS):
         try:
             log.info(f"🔍 API: fetching file info for {link} (attempt {attempt+1})")
-            timeout = aiohttp.ClientTimeout(total=60)
-            async with session.get(f"{API_BASE}?url={link}", timeout=timeout) as resp:
+            timeout = aiohttp.ClientTimeout(total=60, connect=30)
+            async with session.get(f"{API_BASE}?url={link}", timeout=timeout, allow_redirects=True) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
             if not data.get("links"):
                 raise ValueError("API returned no links")
             return data
-        except Exception as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_exc = e
             log.warning(f"API fetch failed for {link}: {e}")
             if attempt < RETRY_ATTEMPTS - 1:
@@ -97,42 +100,55 @@ async def fetch_api_info(session: aiohttp.ClientSession, link: str):
 # ===== Helper: download URL to file with parallel chunks =====
 async def download_chunk(session: aiohttp.ClientSession, url: str, start: int, end: int, file_path: str, chunk_index: int):
     """Download a specific chunk of the file"""
-    headers = {'Range': f'bytes={start}-{end}'}
-    timeout = aiohttp.ClientTimeout(total=900)
+    headers = {
+        'Range': f'bytes={start}-{end}',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://www.terabox.app/',
+    }
+    timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT, connect=30)
     
-    async with session.get(url, headers=headers, timeout=timeout) as r:
+    async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as r:
         if r.status not in (200, 206):
             raise Exception(f"Failed to download chunk {chunk_index}")
         
         chunk_file = f"{file_path}.part{chunk_index}"
         async with aiofiles.open(chunk_file, "wb") as f:
-            async for chunk in r.content.iter_chunked(65536):  # Larger chunk size
+            async for chunk in r.content.iter_chunked(CHUNK_SIZE):
                 if chunk:
                     await f.write(chunk)
     return chunk_file
 
 async def try_download_url(session: aiohttp.ClientSession, url: str, file_path: str):
     """Download file with parallel chunks for maximum speed"""
-    timeout = aiohttp.ClientTimeout(total=60)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://www.terabox.app/',
+    }
+    timeout = aiohttp.ClientTimeout(total=60, connect=30)
     
     # Get file size to enable parallel downloads
-    async with session.head(url, timeout=timeout) as r:
-        file_size = int(r.headers.get('Content-Length', 0))
-        accepts_ranges = r.headers.get('Accept-Ranges') == 'bytes'
+    try:
+        async with session.head(url, headers=headers, timeout=timeout, allow_redirects=True) as r:
+            file_size = int(r.headers.get('Content-Length', 0))
+            accepts_ranges = r.headers.get('Accept-Ranges') == 'bytes'
+    except:
+        # If HEAD fails, fallback to GET
+        file_size = 0
+        accepts_ranges = False
     
     # If server doesn't support ranges or file is small, download normally
     if not accepts_ranges or file_size < 10 * 1024 * 1024:  # Less than 10MB
-        timeout = aiohttp.ClientTimeout(total=900)
-        async with session.get(url, timeout=timeout) as r:
+        timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT, connect=30)
+        async with session.get(url, headers=headers, timeout=timeout, allow_redirects=True) as r:
             r.raise_for_status()
             async with aiofiles.open(file_path, "wb") as f:
-                async for chunk in r.content.iter_chunked(65536):
+                async for chunk in r.content.iter_chunked(CHUNK_SIZE):
                     if chunk:
                         await f.write(chunk)
         return
     
-    # Parallel download for large files
-    num_chunks = 8  # Number of parallel downloads
+    # Parallel download for large files (16 chunks on your powerful server!)
+    num_chunks = 16  # Increased from 8 to 16 for your hardware
     chunk_size = file_size // num_chunks
     
     tasks = []
@@ -149,7 +165,7 @@ async def try_download_url(session: aiohttp.ClientSession, url: str, file_path: 
         for chunk_file in chunk_files:
             async with aiofiles.open(chunk_file, "rb") as cf:
                 while True:
-                    data = await cf.read(65536)
+                    data = await cf.read(CHUNK_SIZE)
                     if not data:
                         break
                     await final_file.write(data)
@@ -157,23 +173,24 @@ async def try_download_url(session: aiohttp.ClientSession, url: str, file_path: 
 
 # ===== Core: download file with API refresh on retry =====
 async def download_file(update: Update, link: str, file_info: dict, session: aiohttp.ClientSession):
-    async with semaphore:  # Semaphore only on actual download, not API fetch
-        filename = file_info["name"]
-        size_mb = file_info.get("size_mb", 0)
-        download_url = file_info.get("original_url")
+    filename = file_info["name"]
+    size_mb = file_info.get("size_mb", 0)
+    download_url = file_info.get("original_url")
 
-        if size_mb * 1024 * 1024 > MAX_TELEGRAM_SIZE:
-            log.warning(f"File too large ({size_mb:.2f} MB): {filename}")
-            await update.message.reply_text(
-                f"⚠️ *{filename}* is too large ({size_mb:.2f} MB).\n"
-                f"👉 [Download Link]({download_url})",
-                parse_mode="Markdown"
-            )
-            return
+    if size_mb * 1024 * 1024 > MAX_TELEGRAM_SIZE:
+        log.warning(f"File too large ({size_mb:.2f} MB): {filename}")
+        await update.message.reply_text(
+            f"⚠️ *{filename}* is too large ({size_mb:.2f} MB).\n"
+            f"👉 [Download Link]({download_url})",
+            parse_mode="Markdown"
+        )
+        return
 
-        file_hash = hashlib.md5(download_url.encode()).hexdigest()
-        file_path = f"/tmp/{file_hash}_{filename}"
+    file_hash = hashlib.md5(download_url.encode()).hexdigest()
+    file_path = f"/tmp/{file_hash}_{filename}"
 
+    # Download with semaphore (limits concurrent downloads)
+    async with semaphore:
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 log.info(f"⬇️ Downloading {filename} (attempt {attempt+1})")
@@ -184,7 +201,7 @@ async def download_file(update: Update, link: str, file_info: dict, session: aio
                 log.warning(f"Download failed for {filename}: {e}")
                 if attempt < RETRY_ATTEMPTS - 1:
                     log.info(f"Refreshing API info and retrying in {RETRY_DELAY * (attempt + 1)}s...")
-                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
                     try:
                         data = await fetch_api_info(session, link)
                         fresh_file = next((f for f in data.get("links", []) if f["name"] == filename), None)
@@ -201,8 +218,9 @@ async def download_file(update: Update, link: str, file_info: dict, session: aio
                         parse_mode="Markdown"
                     )
                     return
-
-        # Send to Telegram
+    
+    # Upload to Telegram (with separate upload semaphore)
+    async with upload_semaphore:
         try:
             log.info(f"📤 Uploading {filename} to Telegram")
             with open(file_path, "rb") as file:
@@ -254,12 +272,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     connector = aiohttp.TCPConnector(
         limit=MAX_CONNECTIONS, 
-        limit_per_host=20,
+        limit_per_host=50,  # High limit per host for your powerful server
         ssl=ssl_context,
         force_close=False,
-        enable_cleanup_closed=True
+        enable_cleanup_closed=True,
+        ttl_dns_cache=300,  # Cache DNS for 5 minutes
+        keepalive_timeout=30  # Keep connections alive
     )
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as session:
         async def run_task(link):
             try:
                 data = await fetch_api_info(session, link)
