@@ -7,14 +7,13 @@ import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import hashlib
-from collections import defaultdict
 
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
-DOWNLOADS = 150
-UPLOADS = 50
+MAX_CONCURRENT_LINKS = 100          # Max links processed at once
+MAX_CONCURRENT_FILES = 100          # Max files per link being downloaded/uploaded
 CHUNK_SIZE = 524288  # 512KB
 # ==================
 
@@ -22,20 +21,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("TeraboxBot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Global resources
+# Global session
 SESSION = None
-DL_SEM = asyncio.Semaphore(DOWNLOADS)
-UP_SEM = asyncio.Semaphore(UPLOADS)
-QUEUE = asyncio.Queue()
-STATS = defaultdict(lambda: {'total': 0, 'processing': 0, 'completed': 0, 'failed': 0, 'progress_msg': None})
-ACTIVE_DOWNLOADS = {}
+LINK_SEM = asyncio.Semaphore(MAX_CONCURRENT_LINKS)
+FILE_SEM = asyncio.Semaphore(MAX_CONCURRENT_FILES)
 
 LINK_REGEX = re.compile(
     r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink)\.[^\s]+",
     re.IGNORECASE
 )
 
-# ===== Session =====
 async def get_session():
     global SESSION
     if SESSION is None or SESSION.closed:
@@ -43,244 +38,127 @@ async def get_session():
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
-        
-        connector = aiohttp.TCPConnector(
-            limit=300,
-            limit_per_host=75,
-            ssl=ssl_ctx,
-            ttl_dns_cache=300
-        )
+        connector = aiohttp.TCPConnector(limit=200, limit_per_host=50, ssl=ssl_ctx, ttl_dns_cache=300)
         SESSION = aiohttp.ClientSession(connector=connector)
     return SESSION
 
-# ===== Download with simpler approach =====
 async def download_file(url: str, path: str, session: aiohttp.ClientSession):
     headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.terabox.app/'}
-    
-    try:
-        async with session.get(url, headers=headers, timeout=60, ssl=False) as r:
-            r.raise_for_status()
-            total = int(r.headers.get('Content-Length', 0))
-            downloaded = 0
-            
-            async with aiofiles.open(path, 'wb') as f:
-                async for chunk in r.content.iter_chunked(CHUNK_SIZE):
-                    if chunk:
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-            
-            if total > 0 and downloaded < total:
-                raise RuntimeError(f"Incomplete download: {downloaded}/{total} bytes")
-                
-    except asyncio.TimeoutError:
-        raise RuntimeError("Download timeout")
-    except Exception as e:
-        raise RuntimeError(f"Download failed: {e}")
+    async with session.get(url, headers=headers, timeout=60, ssl=False) as r:
+        r.raise_for_status()
+        total = int(r.headers.get('Content-Length', 0))
+        downloaded = 0
+        async with aiofiles.open(path, 'wb') as f:
+            async for chunk in r.content.iter_chunked(CHUNK_SIZE):
+                if chunk:
+                    await f.write(chunk)
+                    downloaded += len(chunk)
+        if total > 0 and downloaded < total:
+            raise RuntimeError("Incomplete download")
 
-# ===== Process single file from queue =====
-async def process_file_from_queue(update: Update, file_info: dict, user_id: int):
+async def upload_and_cleanup(update: Update, path: str, name: str):
+    try:
+        with open(path, 'rb') as f:
+            if name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
+                await update.message.reply_video(video=f)
+            else:
+                await update.message.reply_document(document=f)
+        log.info(f"✨ Uploaded: {name}")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+async def process_single_file(update: Update, file_info: dict):
     name = file_info['name']
-    size_mb = file_info.get('size_mb', 0)
+    size = file_info.get('size', 0)  # size in bytes
     url = file_info.get('original_url')
-    
-    if size_mb * 1024 * 1024 > MAX_SIZE:
-        log.warning(f"❌ Too large: {name}")
-        STATS[user_id]['failed'] += 1
-        await update_progress(update, user_id)
+
+    if size > MAX_SIZE:
+        await update.message.reply_text(f"❌ Skipped (too large): {name} (>2GB)")
         return
-    
+
     session = await get_session()
     path = f"/tmp/{hashlib.md5(url.encode()).hexdigest()}_{name}"
-    
-    # Download with semaphore
-    async with DL_SEM:
-        STATS[user_id]['processing'] += 1
-        dl_key = f"{user_id}_{name}"
-        ACTIVE_DOWNLOADS[dl_key] = True
-        
-        try:
-            log.info(f"⬇️ {name}")
-            await download_file(url, path, session)
-            log.info(f"✅ {name}")
-        except Exception as e:
-            log.error(f"❌ {name}: {e}")
-            STATS[user_id]['processing'] -= 1
-            STATS[user_id]['failed'] += 1
-            ACTIVE_DOWNLOADS.pop(dl_key, None)
-            await update_progress(update, user_id)
-            return
-        finally:
-            STATS[user_id]['processing'] -= 1
-    
-    # Upload with separate semaphore (doesn't block downloads)
-    async with UP_SEM:
-        try:
-            log.info(f"📤 {name}")
-            with open(path, 'rb') as f:
-                if name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
-                    await update.message.reply_video(video=f)
-                else:
-                    await update.message.reply_document(document=f)
-            STATS[user_id]['completed'] += 1
-            log.info(f"✨ {name}")
-        except Exception as e:
-            log.error(f"❌ Upload {name}: {e}")
-            STATS[user_id]['failed'] += 1
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
-            ACTIVE_DOWNLOADS.pop(dl_key, None)
-            await update_progress(update, user_id)
 
-# ===== Update progress (edit message only) =====
-async def update_progress(update: Update, user_id: int):
-    if STATS[user_id]['progress_msg'] is None:
-        return
-    
-    stats = STATS[user_id]
-    total = stats['total']
-    done = stats['completed'] + stats['failed']
-    processing = stats['processing']
-    completed = stats['completed']
-    failed = stats['failed']
-    
-    msg = (
-        f"📊 *Progress*\n\n"
-        f"✨ Completed: {completed}\n"
-        f"⚙️ Processing: {processing}\n"
-        f"⏳ Queued: {total - done - processing}\n"
-        f"❌ Failed: {failed}\n"
-        f"📦 Total: {total}"
-    )
-    
-    if done == total and total > 0:
-        msg = (
-            f"✅ *All Done!*\n\n"
-            f"✨ Completed: {completed}\n"
-            f"❌ Failed: {failed}\n"
-            f"📦 Total: {total}"
-        )
-        try:
-            await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
-        except:
-            pass
-        del STATS[user_id]
-    else:
-        try:
-            await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
-        except:
-            pass
-
-# ===== Queue worker =====
-async def queue_worker():
-    while True:
-        update, file_info, user_id = await QUEUE.get()
-        try:
-            await process_file_from_queue(update, file_info, user_id)
-        except Exception as e:
-            log.error(f"Queue worker error: {e}")
-        finally:
-            QUEUE.task_done()
-
-# ===== Process link =====
-async def process_link(update: Update, link: str, user_id: int):
     try:
-        session = await get_session()
-        async with session.get(f"{API_BASE}?url={link}", timeout=30, ssl=False) as r:
-            data = await r.json()
-        
+        log.info(f"⬇️ Downloading: {name}")
+        await download_file(url, path, session)
+        log.info(f"✅ Downloaded: {name}")
+        await upload_and_cleanup(update, path, name)
+    except Exception as e:
+        log.error(f"❌ Failed {name}: {e}")
+        await update.message.reply_text(f"❌ Failed: {name} – {str(e)[:100]}")
+
+async def process_link_independently(update: Update, link: str):
+    async with LINK_SEM:  # Limit total concurrent links
+        try:
+            session = await get_session()
+            async with session.get(f"{API_BASE}?url={link}", timeout=30, ssl=False) as r:
+                data = await r.json()
+        except Exception as e:
+            await update.message.reply_text(f"❌ Invalid or unreachable link: {link[:50]}...")
+            log.error(f"Link fetch failed: {e}")
+            return
+
         files = data.get('links', [])
         if not files:
-            log.warning(f"No files for {link}")
+            await update.message.reply_text("⚠️ No files found in the link.")
             return
-        
-        log.info(f"📦 {len(files)} files from {link}")
-        
-        for file_info in files:
-            STATS[user_id]['total'] += 1
-            await QUEUE.put((update, file_info, user_id))
-            
-    except Exception as e:
-        log.error(f"❌ Link failed {link}: {e}")
 
-# ===== Message Handler =====
+        log.info(f"📦 Found {len(files)} file(s) in {link}")
+
+        # Process each file with limited concurrency per link
+        tasks = []
+        for file_info in files:
+            async with FILE_SEM:  # Prevent too many files from one link overwhelming system
+                task = asyncio.create_task(process_single_file(update, file_info))
+                tasks.append(task)
+
+        # Wait for all files from this link to finish
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or update.message.caption
     if not text:
         return
-    
+
     links = list(dict.fromkeys(LINK_REGEX.findall(text)))
     if not links:
         return
-    
-    user_id = update.effective_user.id
-    log.info(f"🔗 {len(links)} link(s) from user {user_id}")
-    
-    # Create single progress message
-    msg = await update.message.reply_text(
-        f"🎯 *Processing links...*\n\n"
-        f"⏳ Reading files...",
-        parse_mode="Markdown"
-    )
-    STATS[user_id]['progress_msg'] = msg
-    
-    for link in links:
-        await process_link(update, link, user_id)
-    
-    await update_progress(update, user_id)
 
-# ===== Commands =====
+    log.info(f"🔗 Received {len(links)} link(s) from user {update.effective_user.id}")
+
+    if len(links) == 1:
+        await update.message.reply_text("🚀 Processing your Terabox link...")
+    else:
+        await update.message.reply_text(f"🚀 Processing {len(links)} Terabox links...")
+
+    # Launch each link independently — up to MAX_CONCURRENT_LINKS
+    for link in links:
+        asyncio.create_task(process_link_independently(update, link))
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Ultra-Fast Terabox Bot*\n\n"
-        "📥 Send any number of Terabox links!\n"
-        "🚀 150 parallel downloads\n"
-        "📊 Real-time progress updates\n"
-        "⏳ Smart queue system\n\n"
-        "⚠️ Max: 2GB per file",
+        "📥 Send any Terabox link(s)!\n"
+        "🚀 Processes up to 100 links in parallel\n"
+        "📦 Each link downloads all its files\n"
+        "⚠️ Max file size: 2GB",
         parse_mode="Markdown"
     )
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    queue_size = QUEUE.qsize()
-    
-    if user_id in STATS:
-        s = STATS[user_id]
-        msg = (
-            f"📊 *Your Stats*\n\n"
-            f"✨ Completed: {s['completed']}\n"
-            f"⚙️ Processing: {s['processing']}\n"
-            f"❌ Failed: {s['failed']}\n"
-            f"📦 Total: {s['total']}\n\n"
-            f"⏳ Global Queue: {queue_size}"
-        )
-    else:
-        msg = f"📊 *Status*\n\nNo active downloads\n⏳ Global Queue: {queue_size}"
-    
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-# ===== Bot =====
 def main():
-    log.info("🚀 Ultra-Fast Terabox Bot Starting...")
-    
+    log.info("🚀 Terabox Bot Starting (Simplified Mode)...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
     
-    async def init(app):
-        await get_session()
-        for _ in range(DOWNLOADS):
-            asyncio.create_task(queue_worker())
-        log.info(f"✅ Ready! {DOWNLOADS} workers started")
-    
     async def cleanup(app):
+        global SESSION
         if SESSION and not SESSION.closed:
             await SESSION.close()
-    
-    app.post_init = init
     app.post_shutdown = cleanup
+
     app.run_polling()
 
 if __name__ == "__main__":
