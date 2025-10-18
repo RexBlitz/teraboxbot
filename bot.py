@@ -1,4 +1,3 @@
-
 import asyncio
 import re
 import os
@@ -25,6 +24,7 @@ MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?re
 DB_NAME = "terabox_bot"
 DOWNLOADS_COLLECTION = "downloads"
 FAILED_LINKS_COLLECTION = "failed_links"
+USER_SETTINGS_COLLECTION = "user_settings"
 # ==========================
 
 # ===== BROADCAST CONFIG =====
@@ -57,6 +57,7 @@ class MongoDBManager:
         self.db = self.client[DB_NAME]
         self.downloads = self.db[DOWNLOADS_COLLECTION]
         self.failed_links = self.db[FAILED_LINKS_COLLECTION]
+        self.user_settings = self.db[USER_SETTINGS_COLLECTION]
         self._create_indexes()
 
     def _create_indexes(self):
@@ -66,6 +67,7 @@ class MongoDBManager:
         self.failed_links.create_index("timestamp")
         self.failed_links.create_index("user_id")
         self.failed_links.create_index("retry_count")
+        self.user_settings.create_index("user_id")
 
     def record_success(self, user_id: int, link: str, file_name: str, file_size: int, video_link: str = None):
         """Record successful download"""
@@ -162,6 +164,42 @@ class MongoDBManager:
             return True
         except Exception as e:
             log.error(f"❌ Failed to mark retry: {e}")
+            return False
+
+    def get_user_setting(self, user_id: int, setting: str, default=False):
+        """Get user setting"""
+        try:
+            doc = self.user_settings.find_one({"user_id": user_id})
+            if doc:
+                return doc.get(setting, default)
+            return default
+        except Exception as e:
+            log.error(f"❌ Failed to get user setting: {e}")
+            return default
+
+    def set_user_setting(self, user_id: int, setting: str, value):
+        """Set user setting"""
+        try:
+            self.user_settings.update_one(
+                {"user_id": user_id},
+                {"$set": {setting: value, "updated_at": datetime.utcnow()}},
+                upsert=True
+            )
+            log.info(f"✅ Updated setting {setting} for user {user_id}: {value}")
+        except Exception as e:
+            log.error(f"❌ Failed to set user setting: {e}")
+
+    def check_duplicate_download(self, user_id: int, link: str, file_name: str):
+        """Check if file already downloaded"""
+        try:
+            existing = self.downloads.find_one({
+                "user_id": user_id,
+                "original_link": link,
+                "file_name": file_name
+            })
+            return existing is not None
+        except Exception as e:
+            log.error(f"❌ Failed to check duplicate: {e}")
             return False
 
 
@@ -371,15 +409,18 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     stats = db_manager.get_stats(user_id)
+    allow_duplicates = db_manager.get_user_setting(user_id, "allow_duplicates", True)
     
     if not stats:
         await update.message.reply_text("❌ Could not retrieve stats")
         return
 
+    dup_status = "✅ Allowed" if allow_duplicates else "❌ Blocked"
     message = (
         f"📊 *Your Download Stats*\n\n"
         f"✅ Successful: `{stats['total_success']}`\n"
         f"❌ Failed: `{stats['total_failed']}`\n"
+        f"🔄 Duplicates: `{dup_status}`\n"
     )
     await update.message.reply_text(message, parse_mode="Markdown")
 
@@ -435,6 +476,28 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔄 Retrying {retry_count} failed link(s)...", parse_mode="Markdown")
 
 
+async def duplicate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle duplicate download detection"""
+    if not db_manager:
+        await update.message.reply_text("❌ Database not connected")
+        return
+
+    user_id = update.effective_user.id
+    current_status = db_manager.get_user_setting(user_id, "allow_duplicates", True)
+    new_status = not current_status
+    
+    db_manager.set_user_setting(user_id, "allow_duplicates", new_status)
+    
+    status_text = "✅ Allowed" if new_status else "❌ Blocked"
+    message = (
+        f"🔄 *Duplicate Downloads*\n\n"
+        f"Status: {status_text}\n\n"
+        f"When blocked: Won't download files you already have\n"
+        f"When allowed: Downloads everything (default)\n"
+    )
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Ultra-Fast Terabox Bot*\n\n"
@@ -451,6 +514,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("failed", failed_links_command))
     app.add_handler(CommandHandler("retry", retry_command))
+    app.add_handler(CommandHandler("duplicate", duplicate_command))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
 
     async def set_commands(app):
@@ -461,6 +525,7 @@ def main():
             BotCommand("stats", "View your download stats"),
             BotCommand("failed", "Show failed links (optional: /failed 20)"),
             BotCommand("retry", "Retry all failed links"),
+            BotCommand("duplicate", "Enable/Disable duplicate downloads"),
         ]
         await app.bot.set_my_commands(commands)
 
