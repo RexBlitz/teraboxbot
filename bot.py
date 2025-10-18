@@ -126,8 +126,6 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
         finally:
             if os.path.exists(path):
                 os.remove(path)
-            
-            await update_progress(update, user_id)
 
 # ===== Update progress (edit message only) =====
 async def update_progress(update: Update, user_id: int):
@@ -140,6 +138,15 @@ async def update_progress(update: Update, user_id: int):
     processing = stats['processing']
     completed = stats['completed']
     failed = stats['failed']
+    
+    msg = (
+        f"📊 *Progress*\n\n"
+        f"✨ Completed: {completed}\n"
+        f"⚙️ Processing: {processing}\n"
+        f"⏳ Queued: {total - done - processing}\n"
+        f"❌ Failed: {failed}\n"
+        f"📦 Total: {total}"
+    )
     
     if done == total and total > 0:
         msg = (
@@ -154,14 +161,6 @@ async def update_progress(update: Update, user_id: int):
             pass
         del STATS[user_id]
     else:
-        msg = (
-            f"⚡ *Progress Update*\n\n"
-            f"✨ Completed: {completed}\n"
-            f"⚙️ Processing: {processing}\n"
-            f"⏳ Queued: {total - done - processing}\n"
-            f"📦 Total: {total}"
-        )
-        
         try:
             await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
         except:
@@ -212,22 +211,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     log.info(f"🔗 {len(links)} link(s) from user {user_id}")
     
-    queue_size = QUEUE.qsize()
+    # Create single progress message
     msg = await update.message.reply_text(
-        f"🎯 *Got it!*\n\n"
-        f"📥 Processing {len(links)} link(s)\n"
-        f"⚡ 150 parallel downloads\n"
-        f"⏳ Current queue: {queue_size} files\n\n"
-        f"_Starting downloads..._",
+        f"🎯 *Processing links...*\n\n"
+        f"⏳ Reading files...",
         parse_mode="Markdown"
     )
+    STATS[user_id]['progress_msg'] = msg
     
     for link in links:
         await process_link(update, link, user_id)
-    
-    # Set progress message for this user
-    if user_id not in STATS or STATS[user_id]['progress_msg'] is None:
-        STATS[user_id]['progress_msg'] = msg
     
     await update_progress(update, user_id)
 
