@@ -13,9 +13,9 @@ from collections import defaultdict
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
-DOWNLOADS = 100  # Process 100 files at a time
-UPLOADS = 30     # Parallel uploads
-CHUNK_SIZE = 262144  # 256KB chunks
+DOWNLOADS = 150  # Increased from 100 (your server can handle it!)
+UPLOADS = 50     # Increased from 30
+CHUNK_SIZE = 524288  # 512KB - optimized for your super-fast disk!
 # ==================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -44,8 +44,8 @@ async def get_session():
         ssl_ctx.verify_mode = ssl.CERT_NONE
         
         connector = aiohttp.TCPConnector(
-            limit=200,
-            limit_per_host=50,
+            limit=300,  # Increased for 150 downloads
+            limit_per_host=75,  # Increased per-host
             ssl=ssl_ctx,
             ttl_dns_cache=300
         )
@@ -72,7 +72,7 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession):
                     await f.write(chunk)
         return
     
-    chunks = 16
+    chunks = 20  # Increased from 16 for your ultra-fast disk!
     chunk_size = size // chunks
     
     async def get_chunk(i):
