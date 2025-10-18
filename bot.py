@@ -171,10 +171,13 @@ async def download_file(update: Update, link: str, file_info: dict, session: aio
 
 # ===== Message Handler =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or update.message.caption
-    if not text and update.message.forward_date:
-        text = update.message.text or update.message.caption
-
+    # Handle both text messages and captions
+    text = None
+    if update.message.text:
+        text = update.message.text
+    elif update.message.caption:
+        text = update.message.caption
+    
     if not text:
         return
 
@@ -221,7 +224,11 @@ def run_bot():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+        filters.TEXT & ~filters.COMMAND,
+        handle_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.CAPTION & ~filters.COMMAND,
         handle_message
     ))
 
