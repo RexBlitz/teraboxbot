@@ -78,23 +78,24 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession):
 
 # ===== Process single file from queue =====
 async def process_file_from_queue(update: Update, file_info: dict, user_id: int):
+    name = file_info['name']
+    size_mb = file_info.get('size_mb', 0)
+    url = file_info.get('original_url')
+    
+    STATS[user_id]['processing'] += 1
+    
+    if size_mb * 1024 * 1024 > MAX_SIZE:
+        log.warning(f"❌ Too large: {name}")
+        STATS[user_id]['processing'] -= 1
+        STATS[user_id]['failed'] += 1
+        await update_progress(update, user_id)
+        return
+    
+    session = await get_session()
+    path = f"/tmp/{hashlib.md5(url.encode()).hexdigest()}_{name}"
+    
+    # Download with semaphore
     async with DL_SEM:
-        name = file_info['name']
-        size_mb = file_info.get('size_mb', 0)
-        url = file_info.get('original_url')
-        
-        STATS[user_id]['processing'] += 1
-        
-        if size_mb * 1024 * 1024 > MAX_SIZE:
-            log.warning(f"❌ Too large: {name}")
-            STATS[user_id]['processing'] -= 1
-            STATS[user_id]['failed'] += 1
-            await update_progress(update, user_id)
-            return
-        
-        session = await get_session()
-        path = f"/tmp/{hashlib.md5(url.encode()).hexdigest()}_{name}"
-        
         try:
             log.info(f"⬇️ [{STATS[user_id]['processing']}/{STATS[user_id]['total']}] {name}")
             await download_file(url, path, session)
@@ -108,7 +109,7 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
         
         STATS[user_id]['processing'] -= 1
     
-    # Upload
+    # Upload with separate semaphore (doesn't block downloads)
     async with UP_SEM:
         try:
             log.info(f"📤 {name}")
@@ -128,8 +129,11 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
             
             await update_progress(update, user_id)
 
-# ===== Update progress (edit message) =====
+# ===== Update progress (edit message only) =====
 async def update_progress(update: Update, user_id: int):
+    if STATS[user_id]['progress_msg'] is None:
+        return
+    
     stats = STATS[user_id]
     total = stats['total']
     done = stats['completed'] + stats['failed']
@@ -144,11 +148,10 @@ async def update_progress(update: Update, user_id: int):
             f"❌ Failed: {failed}\n"
             f"📦 Total: {total}"
         )
-        if STATS[user_id]['progress_msg']:
-            try:
-                await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
-            except:
-                pass
+        try:
+            await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
+        except:
+            pass
         del STATS[user_id]
     else:
         msg = (
@@ -159,17 +162,10 @@ async def update_progress(update: Update, user_id: int):
             f"📦 Total: {total}"
         )
         
-        if STATS[user_id]['progress_msg']:
-            try:
-                await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
-            except:
-                pass
-        else:
-            try:
-                msg_obj = await update.message.reply_text(msg, parse_mode="Markdown")
-                STATS[user_id]['progress_msg'] = msg_obj
-            except:
-                pass
+        try:
+            await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
+        except:
+            pass
 
 # ===== Queue worker =====
 async def queue_worker():
