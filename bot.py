@@ -17,6 +17,13 @@ CHUNK_SIZE = 1024 * 1024           # 1MB chunks (optimal for high-speed I/O)
 TIMEOUT = 120                      # Seconds
 # ==================
 
+
+BROADCAST_CHATS = [
+    -1002780909369,  # Replace with your chat IDs (use negative for group/channel)
+
+]
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -71,14 +78,60 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession):
             if actual < total:
                 raise RuntimeError(f"Incomplete download: {actual}/{total}")
 
+async def broadcast_video(file_path: str, video_name: str, update: Update):
+    """
+    Broadcasts downloaded video to all preset chats
+    
+    Args:
+        file_path: Path to the downloaded video file
+        video_name: Name of the video file
+        update: The Update object (for error reporting to original sender)
+    """
+    if not BROADCAST_CHATS:
+        log.warning("No broadcast chats configured")
+        return
+
+    # Check if file is a video
+    if not video_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+        return
+
+    broadcast_count = 0
+    for chat_id in BROADCAST_CHATS:
+        try:
+            with open(file_path, 'rb') as f:
+                await update.get_bot().send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    caption=f"📥 *Shared:* `{video_name}`",
+                    parse_mode="Markdown",
+                    supports_streaming=True,
+                    timeout=300
+                )
+            log.info(f"📤 Broadcasted {video_name} to chat {chat_id}")
+            broadcast_count += 1
+        except Exception as e:
+            log.error(f"❌ Broadcast failed for chat {chat_id}: {str(e)[:100]}")
+
+    if broadcast_count > 0:
+        log.info(f"✅ Broadcast complete: {broadcast_count}/{len(BROADCAST_CHATS)} chats")
+
+
 async def upload_and_cleanup(update: Update, path: str, name: str):
     try:
         with open(path, 'rb') as f:
-            if name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+            is_video = name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))
+            if is_video:
                 await update.message.reply_video(video=f, supports_streaming=True)
             else:
                 await update.message.reply_document(document=f)
+        
+        # Broadcast video to other chats
+        if is_video:
+            asyncio.create_task(broadcast_video(path, name, update))
+    
     finally:
+        # Don't delete immediately if broadcasting - wait a bit
+        await asyncio.sleep(2)
         try:
             os.remove(path)
         except OSError:
