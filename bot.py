@@ -37,6 +37,33 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.client").setLevel(logging.WARNING)
 logging.getLogger("telegram.vendor.ptb_urllib3.urllib3").setLevel(logging.WARNING)
 
+# Global session for reuse across messages
+GLOBAL_SESSION = None
+
+async def get_or_create_session():
+    """Get or create a global session"""
+    global GLOBAL_SESSION
+    if GLOBAL_SESSION is None or GLOBAL_SESSION.closed:
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        connector = aiohttp.TCPConnector(
+            limit=MAX_CONNECTIONS, 
+            limit_per_host=50,
+            ssl=ssl_context,
+            force_close=False,
+            enable_cleanup_closed=True,
+            ttl_dns_cache=300,
+            keepalive_timeout=30
+        )
+        GLOBAL_SESSION = aiohttp.ClientSession(
+            connector=connector, 
+            timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
+        )
+    return GLOBAL_SESSION
+
 semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
 upload_semaphore = asyncio.Semaphore(CONCURRENT_UPLOADS)  # Separate semaphore for uploads
 
@@ -258,50 +285,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     log.info(f"🧾 User {update.effective_user.id} sent {len(links)} link(s)")
-    status_msg = await update.message.reply_text(
-        f"🔍 Found {len(links)} Terabox link(s). Processing..."
-    )
-
-    failed_links = []
     
-    # Create optimized session with connection pooling and SSL bypass
-    import ssl
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
+    # No status message - just process in background
+    session = await get_or_create_session()
     
-    connector = aiohttp.TCPConnector(
-        limit=MAX_CONNECTIONS, 
-        limit_per_host=50,  # High limit per host for your powerful server
-        ssl=ssl_context,
-        force_close=False,
-        enable_cleanup_closed=True,
-        ttl_dns_cache=300,  # Cache DNS for 5 minutes
-        keepalive_timeout=30  # Keep connections alive
-    )
-    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as session:
-        async def run_task(link):
-            try:
-                data = await fetch_api_info(session, link)
-                for file_info in data.get("links", []):
-                    await download_file(update, link, file_info, session)
-            except Exception as e:
-                log.error(f"Task failed for {link}: {e}")
-                failed_links.append(link)
+    # Process each link immediately in background
+    for link in links:
+        asyncio.create_task(process_link(update, link, session))
 
-        tasks = [asyncio.create_task(run_task(link)) for link in links]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Send failed links report
-    if failed_links:
-        failed_text = "❌ Failed to process the following link(s):\n" + "\n".join(failed_links)
-        await update.message.reply_text(failed_text)
-    
-    # Delete status message
+async def process_link(update: Update, link: str, session: aiohttp.ClientSession):
+    """Process a single link in background"""
     try:
-        await status_msg.delete()
-    except:
-        pass
+        log.info(f"🔗 Processing link: {link}")
+        data = await fetch_api_info(session, link)
+        
+        # Process all files from this link
+        for file_info in data.get("links", []):
+            asyncio.create_task(download_file(update, link, file_info, session))
+            
+    except Exception as e:
+        log.error(f"❌ Failed to process {link}: {e}")
+        await update.message.reply_text(f"❌ Failed to process link")
 
 # ===== Bot Launcher =====
 def run_bot():
