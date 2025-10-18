@@ -13,9 +13,9 @@ from collections import defaultdict
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
-DOWNLOADS = 150  # Increased from 100 (your server can handle it!)
-UPLOADS = 50     # Increased from 30
-CHUNK_SIZE = 524288  # 512KB - optimized for your super-fast disk!
+DOWNLOADS = 150
+UPLOADS = 50
+CHUNK_SIZE = 524288  # 512KB
 # ==================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -26,8 +26,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 SESSION = None
 DL_SEM = asyncio.Semaphore(DOWNLOADS)
 UP_SEM = asyncio.Semaphore(UPLOADS)
-QUEUE = asyncio.Queue()  # File queue
-STATS = defaultdict(lambda: {'total': 0, 'processing': 0, 'completed': 0, 'failed': 0})
+QUEUE = asyncio.Queue()
+STATS = defaultdict(lambda: {'total': 0, 'processing': 0, 'completed': 0, 'failed': 0, 'progress_msg': None})
 
 LINK_REGEX = re.compile(
     r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink)\.[^\s]+",
@@ -44,49 +44,37 @@ async def get_session():
         ssl_ctx.verify_mode = ssl.CERT_NONE
         
         connector = aiohttp.TCPConnector(
-            limit=300,  # Increased for 150 downloads
-            limit_per_host=75,  # Increased per-host
+            limit=300,
+            limit_per_host=75,
             ssl=ssl_ctx,
             ttl_dns_cache=300
         )
         SESSION = aiohttp.ClientSession(connector=connector)
     return SESSION
 
-# ===== Download with parallel chunks =====
+# ===== Download with simpler approach =====
 async def download_file(url: str, path: str, session: aiohttp.ClientSession):
     headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.terabox.app/'}
     
     try:
-        async with session.head(url, headers=headers, timeout=30) as r:
-            size = int(r.headers.get('Content-Length', 0))
-            ranges = r.headers.get('Accept-Ranges') == 'bytes'
-    except:
-        size = 0
-        ranges = False
-    
-    if not ranges or size < 10 * 1024 * 1024:
-        async with session.get(url, headers=headers) as r:
+        async with session.get(url, headers=headers, timeout=60, ssl=False) as r:
             r.raise_for_status()
+            total = int(r.headers.get('Content-Length', 0))
+            downloaded = 0
+            
             async with aiofiles.open(path, 'wb') as f:
                 async for chunk in r.content.iter_chunked(CHUNK_SIZE):
-                    await f.write(chunk)
-        return
-    
-    chunks = 20  # Increased from 16 for your ultra-fast disk!
-    chunk_size = size // chunks
-    
-    async def get_chunk(i):
-        start = i * chunk_size
-        end = start + chunk_size - 1 if i < chunks - 1 else size - 1
-        h = {**headers, 'Range': f'bytes={start}-{end}'}
-        async with session.get(url, headers=h) as r:
-            return await r.read()
-    
-    parts = await asyncio.gather(*[get_chunk(i) for i in range(chunks)])
-    
-    async with aiofiles.open(path, 'wb') as f:
-        for part in parts:
-            await f.write(part)
+                    if chunk:
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+            
+            if total > 0 and downloaded < total:
+                raise RuntimeError(f"Incomplete download: {downloaded}/{total} bytes")
+                
+    except asyncio.TimeoutError:
+        raise RuntimeError("Download timeout")
+    except Exception as e:
+        raise RuntimeError(f"Download failed: {e}")
 
 # ===== Process single file from queue =====
 async def process_file_from_queue(update: Update, file_info: dict, user_id: int):
@@ -101,6 +89,7 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
             log.warning(f"❌ Too large: {name}")
             STATS[user_id]['processing'] -= 1
             STATS[user_id]['failed'] += 1
+            await update_progress(update, user_id)
             return
         
         session = await get_session()
@@ -114,6 +103,7 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
             log.error(f"❌ {name}: {e}")
             STATS[user_id]['processing'] -= 1
             STATS[user_id]['failed'] += 1
+            await update_progress(update, user_id)
             return
         
         STATS[user_id]['processing'] -= 1
@@ -136,13 +126,10 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
             if os.path.exists(path):
                 os.remove(path)
             
-            # Send progress update every 10 files or when done
-            if STATS[user_id]['completed'] % 10 == 0 or \
-               STATS[user_id]['completed'] + STATS[user_id]['failed'] == STATS[user_id]['total']:
-                await send_progress(update, user_id)
+            await update_progress(update, user_id)
 
-# ===== Progress update =====
-async def send_progress(update: Update, user_id: int):
+# ===== Update progress (edit message) =====
+async def update_progress(update: Update, user_id: int):
     stats = STATS[user_id]
     total = stats['total']
     done = stats['completed'] + stats['failed']
@@ -150,14 +137,18 @@ async def send_progress(update: Update, user_id: int):
     completed = stats['completed']
     failed = stats['failed']
     
-    if done == total:
+    if done == total and total > 0:
         msg = (
             f"✅ *All Done!*\n\n"
             f"✨ Completed: {completed}\n"
             f"❌ Failed: {failed}\n"
             f"📦 Total: {total}"
         )
-        # Reset stats
+        if STATS[user_id]['progress_msg']:
+            try:
+                await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
+            except:
+                pass
         del STATS[user_id]
     else:
         msg = (
@@ -167,11 +158,18 @@ async def send_progress(update: Update, user_id: int):
             f"⏳ Queued: {total - done - processing}\n"
             f"📦 Total: {total}"
         )
-    
-    try:
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except:
-        pass
+        
+        if STATS[user_id]['progress_msg']:
+            try:
+                await STATS[user_id]['progress_msg'].edit_text(msg, parse_mode="Markdown")
+            except:
+                pass
+        else:
+            try:
+                msg_obj = await update.message.reply_text(msg, parse_mode="Markdown")
+                STATS[user_id]['progress_msg'] = msg_obj
+            except:
+                pass
 
 # ===== Queue worker =====
 async def queue_worker():
@@ -188,7 +186,7 @@ async def queue_worker():
 async def process_link(update: Update, link: str, user_id: int):
     try:
         session = await get_session()
-        async with session.get(f"{API_BASE}?url={link}", timeout=30) as r:
+        async with session.get(f"{API_BASE}?url={link}", timeout=30, ssl=False) as r:
             data = await r.json()
         
         files = data.get('links', [])
@@ -198,7 +196,6 @@ async def process_link(update: Update, link: str, user_id: int):
         
         log.info(f"📦 {len(files)} files from {link}")
         
-        # Add all files to queue
         for file_info in files:
             STATS[user_id]['total'] += 1
             await QUEUE.put((update, file_info, user_id))
@@ -219,30 +216,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     log.info(f"🔗 {len(links)} link(s) from user {user_id}")
     
-    # Send instant notification
     queue_size = QUEUE.qsize()
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         f"🎯 *Got it!*\n\n"
         f"📥 Processing {len(links)} link(s)\n"
-        f"⚡ 100 files at a time\n"
+        f"⚡ 150 parallel downloads\n"
         f"⏳ Current queue: {queue_size} files\n\n"
         f"_Starting downloads..._",
         parse_mode="Markdown"
     )
     
-    # Process all links
     for link in links:
         await process_link(update, link, user_id)
     
-    # Send initial stats
-    await send_progress(update, user_id)
+    # Set progress message for this user
+    if user_id not in STATS or STATS[user_id]['progress_msg'] is None:
+        STATS[user_id]['progress_msg'] = msg
+    
+    await update_progress(update, user_id)
 
 # ===== Commands =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Ultra-Fast Terabox Bot*\n\n"
         "📥 Send any number of Terabox links!\n"
-        "🚀 100 parallel downloads\n"
+        "🚀 150 parallel downloads\n"
         "📊 Real-time progress updates\n"
         "⏳ Smart queue system\n\n"
         "⚠️ Max: 2GB per file",
@@ -279,7 +277,6 @@ def main():
     
     async def init(app):
         await get_session()
-        # Start queue workers
         for _ in range(DOWNLOADS):
             asyncio.create_task(queue_worker())
         log.info(f"✅ Ready! {DOWNLOADS} workers started")
