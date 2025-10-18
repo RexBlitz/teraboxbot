@@ -58,6 +58,7 @@ class MongoDBManager:
         self.db = self.client[DB_NAME]
         self.downloads = self.db[DOWNLOADS_COLLECTION]
         self.failed_links = self.db[FAILED_LINKS_COLLECTION]
+        self.oversized_links = self.db[OVERSIZED_LINKS_COLLECTION]
         self.user_settings = self.db[USER_SETTINGS_COLLECTION]
         self._create_indexes()
 
@@ -68,10 +69,12 @@ class MongoDBManager:
         self.failed_links.create_index("timestamp")
         self.failed_links.create_index("user_id")
         self.failed_links.create_index("retry_count")
+        self.oversized_links.create_index("timestamp")
+        self.oversized_links.create_index("user_id")
         self.user_settings.create_index("user_id")
 
     def record_success(self, user_id: int, link: str, file_name: str, file_size: int, video_link: str = None):
-        """Record successful download"""
+        """Record successful download and remove from failed links"""
         try:
             record = {
                 "user_id": user_id,
@@ -84,6 +87,14 @@ class MongoDBManager:
             }
             result = self.downloads.insert_one(record)
             log.info(f"✅ Recorded success: {file_name}")
+            
+            # Remove from failed links if it exists
+            self.failed_links.delete_one({
+                "user_id": user_id,
+                "original_link": link
+            })
+            log.info(f"🗑️ Removed from failed links: {link}")
+            
             return result.inserted_id
         except Exception as e:
             log.error(f"❌ Failed to record success: {e}")
@@ -121,6 +132,30 @@ class MongoDBManager:
         except Exception as e:
             log.error(f"❌ Failed to record failure: {e}")
 
+    def record_oversized(self, user_id: int, link: str, file_name: str, file_size: int):
+        """Record oversized file"""
+        try:
+            existing = self.oversized_links.find_one({
+                "original_link": link,
+                "user_id": user_id,
+                "file_name": file_name
+            })
+            
+            if not existing:
+                record = {
+                    "user_id": user_id,
+                    "original_link": link,
+                    "file_name": file_name,
+                    "file_size": file_size,
+                    "timestamp": datetime.utcnow(),
+                    "status": "oversized"
+                }
+                self.oversized_links.insert_one(record)
+            
+            log.info(f"⚠️ Recorded oversized: {file_name} ({file_size / 1e6:.1f} MB)")
+        except Exception as e:
+            log.error(f"❌ Failed to record oversized: {e}")
+
     def get_stats(self, user_id: int = None):
         """Get download statistics"""
         try:
@@ -151,6 +186,16 @@ class MongoDBManager:
             return failed
         except Exception as e:
             log.error(f"❌ Failed to get failed links: {e}")
+            return []
+
+    def get_oversized_links(self, user_id: int = None, limit: int = 10):
+        """Get list of oversized links"""
+        try:
+            query = {"user_id": user_id} if user_id else {}
+            oversized = list(self.oversized_links.find(query).sort("timestamp", -1).limit(limit))
+            return oversized
+        except Exception as e:
+            log.error(f"❌ Failed to get oversized links: {e}")
             return []
 
     def retry_failed_link(self, link_id: str):
@@ -313,7 +358,8 @@ async def upload_and_cleanup(update: Update, path: str, name: str, link: str, si
 
 async def process_single_file(update: Update, file_info: dict, original_link: str):
     name = file_info.get('name', 'unknown')
-    size = file_info.get('size', 0)  # in bytes
+    size_mb = file_info.get('size_mb', 0)  # API returns size in MB
+    size_bytes = int(size_mb * 1024 * 1024)  # Convert to bytes
     url = file_info.get('original_url')
 
     if not url:
@@ -322,10 +368,12 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
             db_manager.record_failure(update.effective_user.id, original_link, "No download URL")
         return
 
-    if size > MAX_SIZE:
-        await update.message.reply_text(f"❌ Skipped (too large >2GB): {name}")
+    # CHECK SIZE FIRST before downloading
+    if size_bytes > MAX_SIZE:
+        await update.message.reply_text(f"⚠️ File too large ({size_mb:.1f} MB): {name}")
         if db_manager:
-            db_manager.record_failure(update.effective_user.id, original_link, "File too large >2GB")
+            db_manager.record_oversized(update.effective_user.id, original_link, name, size_bytes)
+        log.warning(f"⚠️ Oversized file skipped: {name} ({size_mb:.1f} MB)")
         return
 
     # Use RAM disk for temp files (faster!)
@@ -334,10 +382,10 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
 
     try:
         session = await get_session()
-        log.info(f"⬇️ {name} ({size / 1e6:.1f} MB)")
+        log.info(f"⬇️ {name} ({size_mb:.1f} MB)")
         await download_file(url, path, session)
         log.info(f"✅ Downloaded: {name}")
-        await upload_and_cleanup(update, path, name, original_link, size)
+        await upload_and_cleanup(update, path, name, original_link, size_bytes)
     except Exception as e:
         error_msg = f"❌ Failed: {name} – {str(e)[:120]}"
         log.error(error_msg)
@@ -454,6 +502,35 @@ async def failed_links_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(message, parse_mode="Markdown")
 
 
+async def oversized_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show oversized links with file sizes"""
+    if not db_manager:
+        await update.message.reply_text("❌ Database not connected")
+        return
+
+    user_id = update.effective_user.id
+    
+    # Get count from command args, default to 10
+    limit = 10
+    if context.args and context.args[0].isdigit():
+        limit = min(int(context.args[0]), 100)  # Max 100 to prevent spam
+    
+    oversized = db_manager.get_oversized_links(user_id, limit=limit)
+    
+    if not oversized:
+        await update.message.reply_text("✅ No oversized files!")
+        return
+
+    message = f"⚠️ *Oversized Files (Last {len(oversized)})*\n\n"
+    for idx, item in enumerate(oversized, 1):
+        file_size_mb = item.get('file_size', 0) / 1e6
+        file_name = item.get('file_name', 'unknown')
+        link_preview = item['original_link'][:45] + "..." if len(item['original_link']) > 45 else item['original_link']
+        message += f"{idx}. `{file_name}`\n   Size: `{file_size_mb:.1f} MB`\n   Link: `{link_preview}`\n\n"
+
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Retry failed links"""
     if not db_manager:
@@ -514,6 +591,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("failed", failed_links_command))
+    app.add_handler(CommandHandler("oversized", oversized_command))
     app.add_handler(CommandHandler("retry", retry_command))
     app.add_handler(CommandHandler("duplicate", duplicate_command))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
@@ -525,6 +603,7 @@ def main():
             BotCommand("start", "Start the bot"),
             BotCommand("stats", "View your download stats"),
             BotCommand("failed", "Show failed links (optional: /failed 20)"),
+            BotCommand("oversized", "Show oversized files (optional: /oversized 20)"),
             BotCommand("retry", "Retry all failed links"),
             BotCommand("duplicate", "Enable/Disable duplicate downloads"),
         ]
