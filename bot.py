@@ -28,6 +28,7 @@ DL_SEM = asyncio.Semaphore(DOWNLOADS)
 UP_SEM = asyncio.Semaphore(UPLOADS)
 QUEUE = asyncio.Queue()
 STATS = defaultdict(lambda: {'total': 0, 'processing': 0, 'completed': 0, 'failed': 0, 'progress_msg': None})
+ACTIVE_DOWNLOADS = {}
 
 LINK_REGEX = re.compile(
     r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink)\.[^\s]+",
@@ -82,11 +83,8 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
     size_mb = file_info.get('size_mb', 0)
     url = file_info.get('original_url')
     
-    STATS[user_id]['processing'] += 1
-    
     if size_mb * 1024 * 1024 > MAX_SIZE:
         log.warning(f"❌ Too large: {name}")
-        STATS[user_id]['processing'] -= 1
         STATS[user_id]['failed'] += 1
         await update_progress(update, user_id)
         return
@@ -96,18 +94,23 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
     
     # Download with semaphore
     async with DL_SEM:
+        STATS[user_id]['processing'] += 1
+        dl_key = f"{user_id}_{name}"
+        ACTIVE_DOWNLOADS[dl_key] = True
+        
         try:
-            log.info(f"⬇️ [{STATS[user_id]['processing']}/{STATS[user_id]['total']}] {name}")
+            log.info(f"⬇️ {name}")
             await download_file(url, path, session)
             log.info(f"✅ {name}")
         except Exception as e:
             log.error(f"❌ {name}: {e}")
             STATS[user_id]['processing'] -= 1
             STATS[user_id]['failed'] += 1
+            ACTIVE_DOWNLOADS.pop(dl_key, None)
             await update_progress(update, user_id)
             return
-        
-        STATS[user_id]['processing'] -= 1
+        finally:
+            STATS[user_id]['processing'] -= 1
     
     # Upload with separate semaphore (doesn't block downloads)
     async with UP_SEM:
@@ -119,13 +122,15 @@ async def process_file_from_queue(update: Update, file_info: dict, user_id: int)
                 else:
                     await update.message.reply_document(document=f)
             STATS[user_id]['completed'] += 1
-            log.info(f"✨ [{STATS[user_id]['completed']}/{STATS[user_id]['total']}] {name}")
+            log.info(f"✨ {name}")
         except Exception as e:
             log.error(f"❌ Upload {name}: {e}")
             STATS[user_id]['failed'] += 1
         finally:
             if os.path.exists(path):
                 os.remove(path)
+            ACTIVE_DOWNLOADS.pop(dl_key, None)
+            await update_progress(update, user_id)
 
 # ===== Update progress (edit message only) =====
 async def update_progress(update: Update, user_id: int):
