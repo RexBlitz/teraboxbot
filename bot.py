@@ -13,12 +13,8 @@ BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 MAX_CONCURRENT_LINKS = 50          # Max links processed at once
-CHUNK_SIZE = 1024 * 1024           # 1MB chunks
-TIMEOUT = 120
-
-# 🔁 MIRROR FEATURE: Set to your group/channel ID (e.g., -1001234567890) or None to disable
-MIRROR_CHAT_ID = None  # 👈 SET THIS TO YOUR CHAT ID IF YOU WANT MIRRORING
-
+CHUNK_SIZE = 1024 * 1024           # 1MB chunks (optimal for high-speed I/O)
+TIMEOUT = 120                      # Seconds
 # ==================
 
 logging.basicConfig(
@@ -29,6 +25,7 @@ logging.basicConfig(
 log = logging.getLogger("TeraboxBot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+# Global session
 SESSION = None
 LINK_SEM = asyncio.Semaphore(MAX_CONCURRENT_LINKS)
 
@@ -74,44 +71,22 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession):
             if actual < total:
                 raise RuntimeError(f"Incomplete download: {actual}/{total}")
 
-async def upload_and_cleanup(update: Update, path: str, name: str, context: ContextTypes.DEFAULT_TYPE):
+async def upload_and_cleanup(update: Update, path: str, name: str):
     try:
-        def send_file(chat_id):
-            with open(path, 'rb') as f:
-                if name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.m4v')):
-                    return context.bot.send_video(
-                        chat_id=chat_id,
-                        video=f,
-                        supports_streaming=True,
-                        caption=f"📁 {name}" if chat_id != update.effective_chat.id else None
-                    )
-                else:
-                    return context.bot.send_document(
-                        chat_id=chat_id,
-                        document=f,
-                        caption=f"📁 {name}" if chat_id != update.effective_chat.id else None
-                    )
-
-        # Send to user
-        await send_file(update.effective_chat.id)
-
-        # Mirror to group/channel if enabled
-        if MIRROR_CHAT_ID is not None and MIRROR_CHAT_ID != update.effective_chat.id:
-            try:
-                await send_file(MIRROR_CHAT_ID)
-                log.info(f"📤 Mirrored to {MIRROR_CHAT_ID}: {name}")
-            except Exception as e:
-                log.error(f"❌ Mirror failed for {name}: {e}")
-
+        with open(path, 'rb') as f:
+            if name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+                await update.message.reply_video(video=f, supports_streaming=True)
+            else:
+                await update.message.reply_document(document=f)
     finally:
         try:
             os.remove(path)
         except OSError:
             pass
 
-async def process_single_file(update: Update, file_info: dict, context: ContextTypes.DEFAULT_TYPE):
+async def process_single_file(update: Update, file_info: dict):
     name = file_info.get('name', 'unknown')
-    size = file_info.get('size', 0)
+    size = file_info.get('size', 0)  # in bytes
     url = file_info.get('original_url')
 
     if not url:
@@ -122,18 +97,16 @@ async def process_single_file(update: Update, file_info: dict, context: ContextT
         await update.message.reply_text(f"❌ Skipped (too large >2GB): {name}")
         return
 
-    # Sanitize filename
-    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
-    safe_name = safe_name[:200]  # Telegram filename limit
+    # Use RAM disk for temp files (faster!)
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
     path = f"/dev/shm/terabox_{hashlib.md5(url.encode()).hexdigest()}_{safe_name}"
 
     try:
         session = await get_session()
-        size_mb = size / (1024**2)
-        log.info(f"⬇️ {name} ({size_mb:.1f} MB)")
+        log.info(f"⬇️ {name} ({size / 1e6:.1f} MB)")
         await download_file(url, path, session)
         log.info(f"✅ Downloaded: {name}")
-        await upload_and_cleanup(update, path, name, context)
+        await upload_and_cleanup(update, path, name)
     except Exception as e:
         error_msg = f"❌ Failed: {name} – {str(e)[:120]}"
         log.error(error_msg)
@@ -141,13 +114,11 @@ async def process_single_file(update: Update, file_info: dict, context: ContextT
             await update.message.reply_text(error_msg)
         except:
             pass
+        # Cleanup on failure
         if os.path.exists(path):
-            try:
-                os.remove(path)
-            except:
-                pass
+            os.remove(path)
 
-async def process_link_independently(update: Update, link: str, context: ContextTypes.DEFAULT_TYPE):
+async def process_link_independently(update: Update, link: str):
     async with LINK_SEM:
         try:
             session = await get_session()
@@ -165,22 +136,11 @@ async def process_link_independently(update: Update, link: str, context: Context
             await update.message.reply_text("⚠️ No files found in the link.")
             return
 
-        # Show preview for single file
-        if len(files) == 1:
-            f = files[0]
-            size_mb = f.get('size', 0) / (1024**2)
-            name = f.get('name', 'unknown')
-            await update.message.reply_text(
-                f"📥 *File detected*\n"
-                f"📁 Name: {name}\n"
-                f"📦 Size: {size_mb:.1f} MB\n"
-                f"⏳ Starting download...",
-                parse_mode="Markdown"
-            )
-
         log.info(f"📦 {len(files)} file(s) from {link}")
+
+        # Process files one by one (Terabox is per-file limited)
         for file_info in files:
-            await process_single_file(update, file_info, context)
+            await process_single_file(update, file_info)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or update.message.caption
@@ -200,18 +160,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚀 Processing {len(links)} Terabox links...")
 
     for link in links:
-        asyncio.create_task(process_link_independently(update, link, context))
+        asyncio.create_task(process_link_independently(update, link))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mirror_info = f"\n🔁 Also mirrored to a channel!" if MIRROR_CHAT_ID else ""
     await update.message.reply_text(
         "⚡ *Ultra-Fast Terabox Bot*\n\n"
-        "📥 Send any Terabox link i will download",
+        "📥 Send any Terabox link(s)!\n",
         parse_mode="Markdown"
     )
 
 def main():
-    log.info("🚀 Terabox Bot Starting (with Mirror Support)...")
+    log.info("🚀 Terabox Bot Starting (Optimized for High-Speed Server)...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
