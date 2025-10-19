@@ -9,6 +9,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import hashlib
 from pymongo import MongoClient
 from datetime import datetime
+import aiohttp
+import aiofiles
+import os
+import asyncio
+import hashlib
+import logging
 
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
@@ -279,18 +285,14 @@ async def get_session():
     return SESSION
 
 
+
+
+
 async def download_file(url: str, path: str, session: aiohttp.ClientSession, max_retries: int = 3):
     """
     Resumable, hash-verified downloader for large files.
     Supports retries, content-length validation, and integrity check.
     """
-    import aiohttp
-    import aiofiles
-    import os
-    import asyncio
-    import hashlib
-    import logging
-
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://www.terabox.app/'
@@ -312,27 +314,27 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession, max
 
                     async with aiofiles.open(temp_path, 'ab') as f:
                         downloaded = resume_pos
-                        async for chunk in r.content.iter_chunked(1024 * 1024):
+                        async for chunk in r.content.iter_chunked(1024 * 1024):  # 1MB chunks
                             if chunk:
                                 await f.write(chunk)
                                 hasher.update(chunk)
                                 downloaded += len(chunk)
 
+                    # Verify file size if total is known
                     actual_size = os.path.getsize(temp_path)
                     if total > 0 and actual_size < total:
-                        raise aiohttp.ContentLengthError(
-                            f"Incomplete download ({actual_size}/{total})"
-                        )
+                        raise ValueError(f"Incomplete download ({actual_size}/{total})")
 
+                    # Rename to final file
                     os.replace(temp_path, path)
                     log_hash = hasher.hexdigest()[:8]
                     logging.info(f"✅ Download complete ({actual_size/1e6:.1f} MB, md5={log_hash})")
                     return
 
                 else:
-                    raise RuntimeError(f"Bad status {r.status}")
+                    raise RuntimeError(f"Bad HTTP status {r.status}")
 
-        except (aiohttp.ClientPayloadError, aiohttp.ContentLengthError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientPayloadError, asyncio.TimeoutError, ValueError) as e:
             logging.warning(f"⚠️ Retry {attempt}/{max_retries} for {os.path.basename(path)}: {e}")
             await asyncio.sleep(2 * attempt)
             continue
@@ -342,10 +344,10 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession, max
             await asyncio.sleep(2 * attempt)
             continue
 
+    # Cleanup if download fails completely
     if os.path.exists(temp_path):
         os.remove(temp_path)
-    raise RuntimeError(f"Failed after {max_retries} retries — download incomplete.")
-async def broadcast_video(file_path: str, video_name: str, update: Update):
+    raise RuntimeError(f"Failed after {max_retries} retries — download incomplete.")async def broadcast_video(file_path: str, video_name: str, update: Update):
     """Broadcasts downloaded video to all preset chats"""
     if not BROADCAST_CHATS:
         log.warning("No broadcast chats configured")
