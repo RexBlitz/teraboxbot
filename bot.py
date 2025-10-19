@@ -4,11 +4,17 @@ import os
 import aiohttp
 import aiofiles
 import logging
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import hashlib
 from pymongo import MongoClient
 from datetime import datetime
+import aiohttp
+import aiofiles
+import os
+import asyncio
+import hashlib
+import logging
 
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
@@ -164,6 +170,19 @@ class MongoDBManager:
             
             total_success = self.downloads.count_documents(query)
             total_failed = self.failed_links.count_documents(query)
+            total_oversized = self.oversized_links.count_documents(query)
+            
+            # Count duplicate downloads
+            pipeline = [
+                {"$match": query},
+                {"$group": {
+                    "_id": {"file_name": "$file_name", "original_link": "$original_link"},
+                    "count": {"$sum": 1}
+                }},
+                {"$match": {"count": {"$gt": 1}}}
+            ]
+            duplicate_groups = list(self.downloads.aggregate(pipeline))
+            total_duplicates = sum(group["count"] - 1 for group in duplicate_groups)
             
             total_size = 0
             for doc in self.downloads.find(query):
@@ -172,6 +191,8 @@ class MongoDBManager:
             return {
                 "total_success": total_success,
                 "total_failed": total_failed,
+                "total_oversized": total_oversized,
+                "total_duplicates": total_duplicates,
                 "total_size_gb": round(total_size / (1024**3), 2),
                 "total_size_bytes": total_size
             }
@@ -179,25 +200,47 @@ class MongoDBManager:
             log.error(f"❌ Failed to get stats: {e}")
             return None
 
-    def get_failed_links(self, user_id: int = None, limit: int = 10):
-        """Get list of failed links"""
+    def get_failed_links(self, user_id: int = None, skip: int = 0, limit: int = 10):
+        """Get list of failed links with pagination"""
         try:
             query = {"user_id": user_id} if user_id else {}
-            failed = list(self.failed_links.find(query).sort("last_attempt", -1).limit(limit))
-            return failed
+            failed = list(self.failed_links.find(query).sort("last_attempt", -1).skip(skip).limit(limit))
+            total = self.failed_links.count_documents(query)
+            return failed, total
         except Exception as e:
             log.error(f"❌ Failed to get failed links: {e}")
-            return []
+            return [], 0
 
-    def get_oversized_links(self, user_id: int = None, limit: int = 10):
-        """Get list of oversized links"""
+    def get_oversized_links(self, user_id: int = None, skip: int = 0, limit: int = 10):
+        """Get list of oversized links with pagination"""
         try:
             query = {"user_id": user_id} if user_id else {}
-            oversized = list(self.oversized_links.find(query).sort("timestamp", -1).limit(limit))
-            return oversized
+            oversized = list(self.oversized_links.find(query).sort("timestamp", -1).skip(skip).limit(limit))
+            total = self.oversized_links.count_documents(query)
+            return oversized, total
         except Exception as e:
             log.error(f"❌ Failed to get oversized links: {e}")
-            return []
+            return [], 0
+
+    def clear_user_data(self, user_id: int):
+        """Clear all user data from database"""
+        try:
+            query = {"user_id": user_id}
+            downloads_deleted = self.downloads.delete_many(query).deleted_count
+            failed_deleted = self.failed_links.delete_many(query).deleted_count
+            oversized_deleted = self.oversized_links.delete_many(query).deleted_count
+            settings_deleted = self.user_settings.delete_many(query).deleted_count
+            
+            log.info(f"🗑️ Cleared user {user_id} data: {downloads_deleted} downloads, {failed_deleted} failed, {oversized_deleted} oversized, {settings_deleted} settings")
+            return {
+                "downloads": downloads_deleted,
+                "failed": failed_deleted,
+                "oversized": oversized_deleted,
+                "settings": settings_deleted
+            }
+        except Exception as e:
+            log.error(f"❌ Failed to clear user data: {e}")
+            return None
 
     def retry_failed_link(self, link_id: str):
         """Mark failed link for retry"""
@@ -568,7 +611,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show download statistics"""
+    """Show download statistics with action buttons"""
     if not db_manager:
         await update.message.reply_text("❌ Database not connected")
         return
@@ -586,66 +629,198 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *Your Download Stats*\n\n"
         f"✅ Successful: `{stats['total_success']}`\n"
         f"❌ Failed: `{stats['total_failed']}`\n"
-        f"🔄 Duplicates: `{dup_status}`\n"
+        f"⚠️ Oversized: `{stats['total_oversized']}`\n"
+        f"🔄 Duplicates: `{stats['total_duplicates']}` ({dup_status})\n"
+        f"💾 Total Size: `{stats['total_size_gb']} GB`\n"
     )
-    await update.message.reply_text(message, parse_mode="Markdown")
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("❌ View Failed", callback_data="view_failed_0"),
+            InlineKeyboardButton("⚠️ View Oversized", callback_data="view_oversized_0")
+        ],
+        [
+            InlineKeyboardButton("🔄 Toggle Duplicates", callback_data="toggle_duplicates"),
+            InlineKeyboardButton("🔄 Retry Failed", callback_data="retry_all")
+        ],
+        [
+            InlineKeyboardButton("🗑️ Clear Database", callback_data="clear_db_confirm")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(message, parse_mode="Markdown", reply_markup=reply_markup)
 
 
-async def failed_links_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show failed links with optional count parameter"""
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
     if not db_manager:
-        await update.message.reply_text("❌ Database not connected")
+        await query.edit_message_text("❌ Database not connected")
         return
-
+    
     user_id = update.effective_user.id
+    data = query.data
     
-    # Get count from command args, default to 10
-    limit = 10
-    if context.args and context.args[0].isdigit():
-        limit = min(int(context.args[0]), 100)  # Max 100 to prevent spam
+    # View Failed Links
+    if data.startswith("view_failed_"):
+        page = int(data.split("_")[-1])
+        skip = page * 10
+        failed, total = db_manager.get_failed_links(user_id, skip=skip, limit=10)
+        
+        if not failed:
+            await query.edit_message_text("✅ No failed links!")
+            return
+        
+        message = f"❌ *Failed Links* (Page {page + 1}/{(total - 1) // 10 + 1})\n\n"
+        for idx, item in enumerate(failed, start=skip + 1):
+            retries = item.get('retry_count', 1)
+            error = item.get('last_error', 'Unknown error')[:80]
+            link = item['original_link']
+            message += f"{idx}. `{link}`\n   Retries: {retries} | Error: `{error}`\n\n"
+        
+        # Navigation buttons
+        keyboard = []
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"view_oversized_{page - 1}"))
+        if skip + 10 < total:
+            nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"view_oversized_{page + 1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+        keyboard.append([InlineKeyboardButton("🔙 Back to Stats", callback_data="back_to_stats")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, parse_mode="Markdown", reply_markup=reply_markup)
     
-    failed = db_manager.get_failed_links(user_id, limit=limit)
+    # Toggle Duplicates
+    elif data == "toggle_duplicates":
+        current_status = db_manager.get_user_setting(user_id, "allow_duplicates", True)
+        new_status = not current_status
+        db_manager.set_user_setting(user_id, "allow_duplicates", new_status)
+        
+        status_text = "✅ Allowed" if new_status else "❌ Blocked"
+        await query.edit_message_text(
+            f"🔄 *Duplicate Downloads*\n\n"
+            f"Status: {status_text}\n\n"
+            f"When blocked: Won't download files you already have\n"
+            f"When allowed: Downloads everything (default)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Stats", callback_data="back_to_stats")]])
+        )
     
-    if not failed:
-        await update.message.reply_text("✅ No failed links!")
-        return
-
-    message = f"❌ *Failed Links (Last {len(failed)})*\n\n"
-    for idx, item in enumerate(failed, 1):
-        retries = item.get('retry_count', 1)
-        link_preview = item['original_link'][:50] + "..." if len(item['original_link']) > 50 else item['original_link']
-        message += f"{idx}. `{link_preview}`\n   Retries: {retries}\n"
-
-    await update.message.reply_text(message, parse_mode="Markdown")
-
-
-async def oversized_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show oversized links with file sizes"""
-    if not db_manager:
-        await update.message.reply_text("❌ Database not connected")
-        return
-
-    user_id = update.effective_user.id
+    # Retry All Failed Links
+    elif data == "retry_all":
+        failed, total = db_manager.get_failed_links(user_id, limit=50)
+        
+        if not failed:
+            await query.edit_message_text(
+                "✅ No failed links to retry!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Stats", callback_data="back_to_stats")]])
+            )
+            return
+        
+        retry_count = 0
+        for item in failed:
+            link = item['original_link']
+            db_manager.retry_failed_link(str(item['_id']))
+            # Create a minimal update object for processing
+            from telegram import Message, Chat, User
+            mock_message = Message(
+                message_id=query.message.message_id,
+                date=query.message.date,
+                chat=query.message.chat,
+                from_user=query.from_user
+            )
+            mock_update = Update(update_id=update.update_id, message=mock_message)
+            asyncio.create_task(process_link_independently(mock_update, link))
+            retry_count += 1
+        
+        await query.edit_message_text(
+            f"🔄 Retrying {retry_count} failed link(s)...\n\nYou'll receive notifications as files are processed.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Stats", callback_data="back_to_stats")]])
+        )
     
-    # Get count from command args, default to 10
-    limit = 10
-    if context.args and context.args[0].isdigit():
-        limit = min(int(context.args[0]), 100)  # Max 100 to prevent spam
+    # Clear Database Confirmation
+    elif data == "clear_db_confirm":
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Yes, Clear All", callback_data="clear_db_yes"),
+                InlineKeyboardButton("❌ Cancel", callback_data="back_to_stats")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "⚠️ *Clear Database Confirmation*\n\n"
+            "This will permanently delete:\n"
+            "• All download history\n"
+            "• All failed links\n"
+            "• All oversized files\n"
+            "• All settings\n\n"
+            "Are you sure?",
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
     
-    oversized = db_manager.get_oversized_links(user_id, limit=limit)
+    # Clear Database Execution
+    elif data == "clear_db_yes":
+        result = db_manager.clear_user_data(user_id)
+        
+        if result:
+            message = (
+                f"✅ *Database Cleared Successfully!*\n\n"
+                f"Deleted:\n"
+                f"• Downloads: `{result['downloads']}`\n"
+                f"• Failed Links: `{result['failed']}`\n"
+                f"• Oversized Files: `{result['oversized']}`\n"
+                f"• Settings: `{result['settings']}`\n"
+            )
+        else:
+            message = "❌ Failed to clear database. Please try again."
+        
+        await query.edit_message_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Stats", callback_data="back_to_stats")]])
+        )
     
-    if not oversized:
-        await update.message.reply_text("✅ No oversized files!")
-        return
-
-    message = f"⚠️ *Oversized Files (Last {len(oversized)})*\n\n"
-    for idx, item in enumerate(oversized, 1):
-        file_size_mb = item.get('file_size', 0) / 1e6
-        file_name = item.get('file_name', 'unknown')
-        link_preview = item['original_link'][:45] + "..." if len(item['original_link']) > 45 else item['original_link']
-        message += f"{idx}. `{file_name}`\n   Size: `{file_size_mb:.1f} MB`\n   Link: `{link_preview}`\n\n"
-
-    await update.message.reply_text(message, parse_mode="Markdown")
+    # Back to Stats
+    elif data == "back_to_stats":
+        stats = db_manager.get_stats(user_id)
+        allow_duplicates = db_manager.get_user_setting(user_id, "allow_duplicates", True)
+        
+        if not stats:
+            await query.edit_message_text("❌ Could not retrieve stats")
+            return
+        
+        dup_status = "✅ Allowed" if allow_duplicates else "❌ Blocked"
+        message = (
+            f"📊 *Your Download Stats*\n\n"
+            f"✅ Successful: `{stats['total_success']}`\n"
+            f"❌ Failed: `{stats['total_failed']}`\n"
+            f"⚠️ Oversized: `{stats['total_oversized']}`\n"
+            f"🔄 Duplicates: `{stats['total_duplicates']}` ({dup_status})\n"
+            f"💾 Total Size: `{stats['total_size_gb']} GB`\n"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("❌ View Failed", callback_data="view_failed_0"),
+                InlineKeyboardButton("⚠️ View Oversized", callback_data="view_oversized_0")
+            ],
+            [
+                InlineKeyboardButton("🔄 Toggle Duplicates", callback_data="toggle_duplicates")
+            ],
+            [
+                InlineKeyboardButton("🗑️ Clear Database", callback_data="clear_db_confirm")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(message, parse_mode="Markdown", reply_markup=reply_markup)
 
 
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -655,7 +830,7 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    failed = db_manager.get_failed_links(user_id, limit=50)
+    failed, total = db_manager.get_failed_links(user_id, limit=50)
     
     if not failed:
         await update.message.reply_text("✅ No failed links to retry!")
@@ -671,33 +846,12 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔄 Retrying {retry_count} failed link(s)...", parse_mode="Markdown")
 
 
-async def duplicate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle duplicate download detection"""
-    if not db_manager:
-        await update.message.reply_text("❌ Database not connected")
-        return
-
-    user_id = update.effective_user.id
-    current_status = db_manager.get_user_setting(user_id, "allow_duplicates", True)
-    new_status = not current_status
-    
-    db_manager.set_user_setting(user_id, "allow_duplicates", new_status)
-    
-    status_text = "✅ Allowed" if new_status else "❌ Blocked"
-    message = (
-        f"🔄 *Duplicate Downloads*\n\n"
-        f"Status: {status_text}\n\n"
-        f"When blocked: Won't download files you already have\n"
-        f"When allowed: Downloads everything (default)\n"
-    )
-    await update.message.reply_text(message, parse_mode="Markdown")
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Ultra-Fast Terabox Bot*\n\n"
         "📥 Send any Terabox link(s)!\n"
-        "🔄 Auto-retry with fresh URLs on failure\n",
+        "🔄 Auto-retry with fresh URLs on failure\n\n"
+        "Use /stats to view your download statistics",
         parse_mode="Markdown"
     )
 
@@ -708,10 +862,8 @@ def main():
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("failed", failed_links_command))
-    app.add_handler(CommandHandler("oversized", oversized_command))
     app.add_handler(CommandHandler("retry", retry_command))
-    app.add_handler(CommandHandler("duplicate", duplicate_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
 
     async def set_commands(app):
@@ -719,11 +871,8 @@ def main():
         from telegram import BotCommand
         commands = [
             BotCommand("start", "Start the bot"),
-            BotCommand("stats", "View your download stats"),
-            BotCommand("failed", "Show failed links (optional: /failed 20)"),
-            BotCommand("oversized", "Show oversized files (optional: /oversized 20)"),
+            BotCommand("stats", "View your download stats with options"),
             BotCommand("retry", "Retry all failed links"),
-            BotCommand("duplicate", "Enable/Disable duplicate downloads"),
         ]
         await app.bot.set_my_commands(commands)
 
@@ -740,3 +889,34 @@ def main():
 
 if __name__ == "__main__":
     main()
+        keyboard = []
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"view_failed_{page - 1}"))
+        if skip + 10 < total:
+            nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"view_failed_{page + 1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+        keyboard.append([InlineKeyboardButton("🔙 Back to Stats", callback_data="back_to_stats")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, parse_mode="Markdown", reply_markup=reply_markup)
+    
+    # View Oversized Links
+    elif data.startswith("view_oversized_"):
+        page = int(data.split("_")[-1])
+        skip = page * 10
+        oversized, total = db_manager.get_oversized_links(user_id, skip=skip, limit=10)
+        
+        if not oversized:
+            await query.edit_message_text("✅ No oversized files!")
+            return
+        
+        message = f"⚠️ *Oversized Files* (Page {page + 1}/{(total - 1) // 10 + 1})\n\n"
+        for idx, item in enumerate(oversized, start=skip + 1):
+            file_size_mb = item.get('file_size', 0) / 1e6
+            file_name = item.get('file_name', 'unknown')
+            link = item['original_link']
+            message += f"{idx}. `{file_name}`\n   Size: `{file_size_mb:.1f} MB`\n   Link: `{link}`\n\n"
+        
+        # Navigation buttons
