@@ -9,12 +9,6 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import hashlib
 from pymongo import MongoClient
 from datetime import datetime
-import aiohttp
-import aiofiles
-import os
-import asyncio
-import hashlib
-import logging
 
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
@@ -23,6 +17,7 @@ MAX_SIZE = 50 * 1024 * 1024           # 50MB (Telegram API limit for videos)
 MAX_CONCURRENT_LINKS = 50          # Max links processed at once
 CHUNK_SIZE = 1024 * 1024           # 1MB chunks (optimal for high-speed I/O)
 TIMEOUT = 120                      # Seconds
+MAX_DOWNLOAD_RETRIES = 3           # Max retries for download with fresh API calls
 # ==================
 
 # ===== MONGODB CONFIG =====
@@ -285,7 +280,35 @@ async def get_session():
     return SESSION
 
 
-
+async def fetch_fresh_direct_url(original_link: str, file_name: str, session: aiohttp.ClientSession):
+    """
+    Fetch a fresh direct_url from the API for a specific file.
+    Returns the direct_url and file_info dict, or (None, None) on failure.
+    """
+    try:
+        log.info(f"🔄 Fetching fresh direct_url for: {file_name}")
+        async with session.get(f"{API_BASE}?url={original_link}", ssl=False) as r:
+            if r.status != 200:
+                log.error(f"❌ API returned status {r.status}")
+                return None, None
+            
+            data = await r.json()
+            files = data.get('links', [])
+            
+            # Find the matching file by name
+            for file_info in files:
+                if file_info.get('name') == file_name:
+                    direct_url = file_info.get('direct_url')
+                    if direct_url:
+                        log.info(f"✅ Got fresh direct_url for: {file_name}")
+                        return direct_url, file_info
+            
+            log.error(f"❌ File not found in API response: {file_name}")
+            return None, None
+            
+    except Exception as e:
+        log.error(f"❌ Failed to fetch fresh direct_url: {e}")
+        return None, None
 
 
 async def download_file(url: str, path: str, session: aiohttp.ClientSession, max_retries: int = 3):
@@ -350,7 +373,6 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession, max
     raise RuntimeError(f"Failed after {max_retries} retries — download incomplete.")
 
 
-
 async def broadcast_video(file_path: str, video_name: str, update: Update):
     """Broadcasts downloaded video to all preset chats"""
     if not BROADCAST_CHATS:
@@ -409,16 +431,22 @@ async def upload_and_cleanup(update: Update, path: str, name: str, link: str, si
             pass
 
 
-async def process_single_file(update: Update, file_info: dict, original_link: str):
+async def process_single_file(update: Update, file_info: dict, original_link: str, retry_count: int = 0):
+    """
+    Process a single file with smart retry mechanism.
+    Fetches fresh direct_url from API on each retry attempt.
+    """
     name = file_info.get('name', 'unknown')
     size_mb = file_info.get('size_mb', 0)
     size_bytes = int(size_mb * 1024 * 1024)
-    url = file_info.get('original_url')
+    
+    # Get direct_url
+    url = file_info.get('direct_url')
 
     if not url:
-        await update.message.reply_text(f"❌ No download URL for: {name}")
+        await update.message.reply_text(f"❌ No direct download URL for: {name}")
         if db_manager:
-            db_manager.record_failure(update.effective_user.id, original_link, "No download URL")
+            db_manager.record_failure(update.effective_user.id, original_link, "No direct_url available")
         return
 
     if size_bytes > MAX_SIZE:
@@ -429,27 +457,64 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
         return
 
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-    path = f"/tmp/terabox_{hashlib.md5(url.encode()).hexdigest()}_{safe_name}"  # Use /tmp/ for disk storage
+    path = f"/tmp/terabox_{hashlib.md5(url.encode()).hexdigest()}_{safe_name}"
 
-    try:
-        session = await get_session()
-        log.info(f"⬇️ {name} ({size_mb:.1f} MB)")
-        await download_file(url, path, session)
-        log.info(f"✅ Downloaded: {name}")
-        await upload_and_cleanup(update, path, name, original_link, size_bytes)
-    except Exception as e:
-        error_msg = f"❌ Failed: {name} – {str(e)[:120]}"
-        log.error(error_msg)
-        if db_manager:
-            db_manager.record_failure(update.effective_user.id, original_link, str(e)[:200])
-        await update.message.reply_text(error_msg)
-    finally:
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-                log.info(f"🗑️ Cleaned up: {path}")
-            except OSError as e:
-                log.error(f"❌ Failed to clean up {path}: {e}")
+    session = await get_session()
+    
+    # Try download with retries and fresh API calls
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        try:
+            if attempt > 1:
+                # Fetch fresh direct_url from API for retry attempts
+                log.info(f"🔄 Retry attempt {attempt}/{MAX_DOWNLOAD_RETRIES} for: {name}")
+                await asyncio.sleep(3 * attempt)  # Exponential backoff
+                
+                fresh_url, fresh_file_info = await fetch_fresh_direct_url(original_link, name, session)
+                
+                if not fresh_url:
+                    log.error(f"❌ Could not get fresh direct_url for retry {attempt}")
+                    if attempt == MAX_DOWNLOAD_RETRIES:
+                        raise Exception("Failed to get fresh direct_url after all retries")
+                    continue
+                
+                url = fresh_url
+                # Update path with new URL hash
+                path = f"/tmp/terabox_{hashlib.md5(url.encode()).hexdigest()}_{safe_name}"
+            
+            log.info(f"⬇️ [{attempt}/{MAX_DOWNLOAD_RETRIES}] {name} ({size_mb:.1f} MB)")
+            await download_file(url, path, session)
+            log.info(f"✅ Downloaded: {name}")
+            
+            # Upload successful - break retry loop
+            await upload_and_cleanup(update, path, name, original_link, size_bytes)
+            return
+            
+        except Exception as e:
+            error_msg = str(e)[:200]
+            log.error(f"❌ Download failed (attempt {attempt}/{MAX_DOWNLOAD_RETRIES}): {name} – {error_msg}")
+            
+            # Clean up partial file
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if os.path.exists(path + ".part"):
+                try:
+                    os.remove(path + ".part")
+                except OSError:
+                    pass
+            
+            # If this was the last attempt, record failure and notify user
+            if attempt == MAX_DOWNLOAD_RETRIES:
+                if db_manager:
+                    db_manager.record_failure(update.effective_user.id, original_link, error_msg)
+                await update.message.reply_text(
+                    f"❌ Failed after {MAX_DOWNLOAD_RETRIES} attempts: {name}\n"
+                    f"Error: {str(e)[:100]}"
+                )
+            # Otherwise continue to next retry attempt
+            continue
 
 
 async def process_link_independently(update: Update, link: str):
@@ -476,7 +541,7 @@ async def process_link_independently(update: Update, link: str):
 
         log.info(f"📦 {len(files)} file(s) from {link}")
 
-        # Process files one by one (Terabox is per-file limited)
+        # Process files one by one
         for file_info in files:
             await process_single_file(update, file_info, link)
 
@@ -631,13 +696,14 @@ async def duplicate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Ultra-Fast Terabox Bot*\n\n"
-        "📥 Send any Terabox link(s)!\n",
+        "📥 Send any Terabox link(s)!\n"
+        "🔄 Auto-retry with fresh URLs on failure\n",
         parse_mode="Markdown"
     )
 
 
 def main():
-    log.info("🚀 Terabox Bot Starting (Optimized for High-Speed Server)...")
+    log.info("🚀 Terabox Bot Starting (Smart Retry Enabled)...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
