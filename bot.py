@@ -347,7 +347,9 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession, max
     # Cleanup if download fails completely
     if os.path.exists(temp_path):
         os.remove(temp_path)
-    raise RuntimeError(f"Failed after {max_retries} retries — download incomplete.")async def broadcast_video(file_path: str, video_name: str, update: Update):
+    raise RuntimeError(f"Failed after {max_retries} retries — download incomplete.")
+    
+    async def broadcast_video(file_path: str, video_name: str, update: Update):
     """Broadcasts downloaded video to all preset chats"""
     if not BROADCAST_CHATS:
         log.warning("No broadcast chats configured")
