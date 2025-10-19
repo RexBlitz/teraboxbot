@@ -9,12 +9,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 import hashlib
 from pymongo import MongoClient
 from datetime import datetime
-import aiohttp
-import aiofiles
-import os
-import asyncio
-import hashlib
-import logging
+
 
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
