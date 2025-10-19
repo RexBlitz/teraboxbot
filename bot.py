@@ -358,8 +358,8 @@ async def upload_and_cleanup(update: Update, path: str, name: str, link: str, si
 
 async def process_single_file(update: Update, file_info: dict, original_link: str):
     name = file_info.get('name', 'unknown')
-    size_mb = file_info.get('size_mb', 0)  # API returns size in MB
-    size_bytes = int(size_mb * 1024 * 1024)  # Convert to bytes
+    size_mb = file_info.get('size_mb', 0)
+    size_bytes = int(size_mb * 1024 * 1024)
     url = file_info.get('original_url')
 
     if not url:
@@ -368,7 +368,6 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
             db_manager.record_failure(update.effective_user.id, original_link, "No download URL")
         return
 
-    # CHECK SIZE FIRST before downloading
     if size_bytes > MAX_SIZE:
         await update.message.reply_text(f"⚠️ File too large ({size_mb:.1f} MB): {name}")
         if db_manager:
@@ -376,9 +375,8 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
         log.warning(f"⚠️ Oversized file skipped: {name} ({size_mb:.1f} MB)")
         return
 
-    # Use RAM disk for temp files (faster!)
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
-    path = f"/dev/shm/terabox_{hashlib.md5(url.encode()).hexdigest()}_{safe_name}"
+    path = f"/tmp/terabox_{hashlib.md5(url.encode()).hexdigest()}_{safe_name}"  # Use /tmp/ for disk storage
 
     try:
         session = await get_session()
@@ -391,13 +389,14 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
         log.error(error_msg)
         if db_manager:
             db_manager.record_failure(update.effective_user.id, original_link, str(e)[:200])
-        try:
-            await update.message.reply_text(error_msg)
-        except:
-            pass
-        # Cleanup on failure
+        await update.message.reply_text(error_msg)
+    finally:
         if os.path.exists(path):
-            os.remove(path)
+            try:
+                os.remove(path)
+                log.info(f"🗑️ Cleaned up: {path}")
+            except OSError as e:
+                log.error(f"❌ Failed to clean up {path}: {e}")
 
 
 async def process_link_independently(update: Update, link: str):
