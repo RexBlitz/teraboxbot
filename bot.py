@@ -313,7 +313,6 @@ async def broadcast_video(file_path: str, video_name: str, update: Update):
                 await update.get_bot().send_video(
                     chat_id=chat_id,
                     video=f,
-                    caption=f"📥 Shared: {video_name}",
                     supports_streaming=True
                 )
             log.info(f"📤 Broadcasted {video_name} to chat {chat_id}")
