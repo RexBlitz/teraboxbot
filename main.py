@@ -574,10 +574,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     log.info("🚀 Terabox Bot Starting (Smart URL Retry)...")
-    app = (
+app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .base_url("http://172.17.0.1:8081/bot")
+        .base_url("http://172.17.0.1:8081/bot") # This is correct for 0.0.0.0:8081 on a Linux host
         .build()
     )
     
