@@ -1,23 +1,31 @@
 # ===== Base Image =====
 FROM python:3.11-slim
 
-# ===== Install system dependencies =====
+# ===== Install system dependencies for building telegram-bot-api =====
 RUN apt-get update && apt-get install -y \
-    curl \
-    ca-certificates \
+    git \
+    cmake \
+    g++ \
+    make \
+    libssl-dev \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ===== Set Workdir =====
 WORKDIR /app
 
-# ===== Install Telegram Bot API Server Binary =====
+# ===== Build telegram-bot-api from source =====
 RUN git clone --depth=1 --branch v1.6.3 https://github.com/tdlib/telegram-bot-api.git /tmp/telegram-bot-api-src \
     && mkdir -p /tmp/telegram-bot-api-build \
     && cd /tmp/telegram-bot-api-build \
-    && cmake /tmp/telegram-bot-api-src \
+    && cmake -DCMAKE_BUILD_TYPE=Release /tmp/telegram-bot-api-src \
     && make -j$(nproc) \
     && cp telegram-bot-api /usr/local/bin/ \
     && rm -rf /tmp/telegram-bot-api-src /tmp/telegram-bot-api-build
+
+# ===== Install Python dependencies =====
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 
 # ===== Copy Requirements & Install Python Deps =====
