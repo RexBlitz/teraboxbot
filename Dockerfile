@@ -1,5 +1,5 @@
-# ===== Multi-stage Build =====
-FROM python:3.11-slim as bot-base
+# ===== Base Image =====
+FROM python:3.11-slim
 
 # ===== Install System Dependencies =====
 RUN apt-get update && apt-get install -y \
@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y \
     gperf \
     wget \
     curl \
+    bash \
     && rm -rf /var/lib/apt/lists/*
 
 # ===== Build Telegram Bot API Server =====
@@ -32,23 +33,20 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ===== Copy Bot Code =====
-COPY main.py .
+# ===== Copy All Bot Files =====
+COPY . .
 
 # ===== Create Startup Script =====
-RUN echo '#!/bin/bash\n\
+RUN printf '#!/bin/bash\n\
 set -e\n\
 \n\
-# Start Telegram Bot API Server in background\n\
 echo "🚀 Starting local Telegram Bot API server..."\n\
 telegram-bot-api --api-id=20984573 --api-hash=9f694b45564ad23675aa3a01ffa9b7ca --local 2>&1 | tee /tmp/api.log &\n\
 API_PID=$!\n\
 \n\
-# Wait for API server to be ready\n\
 echo "⏳ Waiting for API server to start..."\n\
-sleep 5\n\
+sleep 8\n\
 \n\
-# Check if API server is running\n\
 if ! kill -0 $API_PID 2>/dev/null; then\n\
     echo "❌ Failed to start Telegram Bot API server"\n\
     cat /tmp/api.log\n\
@@ -58,12 +56,14 @@ fi\n\
 echo "✅ Telegram Bot API server started (PID: $API_PID)"\n\
 echo "🤖 Starting bot..."\n\
 \n\
-# Start the bot\n\
-python3 main.py\n\
-' > /app/start.sh && chmod +x /app/start.sh
+python3 main.py\n' > /app/start.sh && chmod +x /app/start.sh
 
 # ===== Expose Ports =====
 EXPOSE 8081 8082
+
+# ===== Health Check =====
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+  CMD curl -f http://localhost:8081 || exit 1
 
 # ===== Run Script =====
 CMD ["/app/start.sh"]
