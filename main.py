@@ -577,7 +577,7 @@ def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .base_url("http://app.arshman.space:8081/bot")
+        .base_url("http://172.17.0.1:8081/bot")
         .build()
     )
     
