@@ -1,7 +1,7 @@
 # ===== Base Image =====
 FROM python:3.11-slim
 
-# ===== Install system dependencies for building telegram-bot-api =====
+# ===== Install ALL build dependencies (including gperf!) =====
 RUN apt-get update && apt-get install -y \
     git \
     cmake \
@@ -9,30 +9,26 @@ RUN apt-get update && apt-get install -y \
     make \
     libssl-dev \
     zlib1g-dev \
+    gperf \
     && rm -rf /var/lib/apt/lists/*
 
 # ===== Set Workdir =====
 WORKDIR /app
 
 # ===== Build telegram-bot-api from source =====
-RUN git clone --recursive https://github.com/tdlib/telegram-bot-api.git && \
-    cd telegram-bot-api && \
-    mkdir build && \
-    cd build && \
-    cmake -DCMAKE_BUILD_TYPE=Release .. && \
-    cmake --build . --target install && \
-    cd ../.. && \
-    rm -rf telegram-bot-api
+RUN git clone --recursive https://github.com/tdlib/telegram-bot-api.git /tmp/src \
+    && cd /tmp/src \
+    && git checkout v1.6.3 \
+    && mkdir /tmp/build \
+    && cd /tmp/build \
+    && cmake -DCMAKE_BUILD_TYPE=Release /tmp/src \
+    && cmake --build . --target install \
+    && rm -rf /tmp/src /tmp/build
 
-
-# ===== Install Python dependencies =====
+# ===== Install Python deps =====
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-
-# ===== Copy Requirements & Install Python Deps =====
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
 # ===== Copy Bot Code =====
 COPY . .
