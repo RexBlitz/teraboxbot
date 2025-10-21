@@ -707,7 +707,7 @@ def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .base_url("http://localhost:8081/bot")  # 👈 Use local Bot API server
+        .base_url("http://129.146.7.195:8081/bot")  # 👈 Use local Bot API server
         .build()
     )
     
