@@ -11,11 +11,14 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # ===== Install Telegram Bot API Server Binary =====
-RUN curl -L -o telegram-bot-api.tar.gz \
-    https://github.com/tdlib/telegram-bot-api/releases/download/v1.6.3/telegram-bot-api-linux-amd64.tar.gz \
-    && tar -xzf telegram-bot-api.tar.gz \
-    && mv telegram-bot-api /usr/local/bin/telegram-bot-api \
-    && rm -rf telegram-bot-api.tar.gz
+RUN git clone --depth=1 --branch v1.6.3 https://github.com/tdlib/telegram-bot-api.git /tmp/telegram-bot-api-src \
+    && mkdir -p /tmp/telegram-bot-api-build \
+    && cd /tmp/telegram-bot-api-build \
+    && cmake /tmp/telegram-bot-api-src \
+    && make -j$(nproc) \
+    && cp telegram-bot-api /usr/local/bin/ \
+    && rm -rf /tmp/telegram-bot-api-src /tmp/telegram-bot-api-build
+
 
 # ===== Copy Requirements & Install Python Deps =====
 COPY requirements.txt .
