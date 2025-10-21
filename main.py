@@ -16,7 +16,9 @@ API_BASE = "https://terabox.itxarshman.workers.dev/api"
 MAX_SIZE = 2000 * 1024 * 1024  # 2GB
 MAX_CONCURRENT_LINKS = 50
 CHUNK_SIZE = 1024 * 1024
-TIMEOUT = 120
+CONNECT_TIMEOUT = 30      # Connection timeout
+READ_TIMEOUT = 300        # Read timeout (5 minutes per chunk)
+TOTAL_TIMEOUT = 3600      # Total timeout (1 hour max)
 # ==================
 
 # ===== MONGODB CONFIG =====
@@ -204,7 +206,11 @@ async def get_session():
         )
         SESSION = aiohttp.ClientSession(
             connector=connector,
-            timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+            timeout=aiohttp.ClientTimeout(
+                total=TOTAL_TIMEOUT,
+                connect=CONNECT_TIMEOUT,
+                sock_read=READ_TIMEOUT
+            )
         )
     return SESSION
 
@@ -216,7 +222,8 @@ async def fetch_file_urls(original_link: str, file_name: str, session: aiohttp.C
     """
     try:
         log.info(f"🔄 Fetching URLs for: {file_name}")
-        async with session.get(f"{API_BASE}?url={original_link}", ssl=False) as r:
+        timeout = aiohttp.ClientTimeout(total=CONNECT_TIMEOUT)
+        async with session.get(f"{API_BASE}?url={original_link}", ssl=False, timeout=timeout) as r:
             if r.status != 200:
                 log.error(f"❌ API returned status {r.status}")
                 return None, None, None
@@ -242,7 +249,7 @@ async def fetch_file_urls(original_link: str, file_name: str, session: aiohttp.C
 
 async def download_file(url: str, path: str, session: aiohttp.ClientSession):
     """
-    Resumable, hash-verified downloader for large files.
+    Resumable, hash-verified downloader with proper timeout handling.
     Raises exception on failure.
     """
     headers = {
@@ -257,7 +264,14 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession):
         resume_pos = os.path.getsize(temp_path)
         headers['Range'] = f"bytes={resume_pos}-"
 
-    async with session.get(url, headers=headers, ssl=False) as r:
+    # Override timeout for this specific download
+    timeout = aiohttp.ClientTimeout(
+        total=TOTAL_TIMEOUT,
+        connect=CONNECT_TIMEOUT,
+        sock_read=READ_TIMEOUT
+    )
+
+    async with session.get(url, headers=headers, ssl=False, timeout=timeout) as r:
         if r.status not in (200, 206):
             raise RuntimeError(f"Bad HTTP status {r.status}")
             
@@ -443,7 +457,8 @@ async def process_link_independently(update: Update, link: str):
     async with LINK_SEM:
         try:
             session = await get_session()
-            async with session.get(f"{API_BASE}?url={link}", ssl=False) as r:
+            timeout = aiohttp.ClientTimeout(total=CONNECT_TIMEOUT)
+            async with session.get(f"{API_BASE}?url={link}", ssl=False, timeout=timeout) as r:
                 if r.status != 200:
                     raise Exception(f"API returned {r.status}")
                 data = await r.json()
@@ -563,7 +578,11 @@ async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Ultra-Fast Terabox Bot*\n\n"
-        "📥 Send any Terabox link(s)!\n",
+        "📥 Send any Terabox link(s)!\n"
+        "🔄 Smart retry: original→direct→fresh→original→direct\n"
+        "📊 Use /stats to see your downloads\n"
+        "❌ Use /failed to see failed links\n"
+        "🔁 Use /retry to retry failed downloads\n",
         parse_mode="Markdown"
     )
 
@@ -573,7 +592,7 @@ def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .base_url("http://host.docker.internal:8081/bot")
+        .base_url("http://localhost:8081/bot")
         .build()
     )
     
