@@ -15,13 +15,15 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # ===== Build telegram-bot-api from source =====
-RUN git clone --depth=1 --branch v1.6.3 https://github.com/tdlib/telegram-bot-api.git /tmp/telegram-bot-api-src \
-    && mkdir -p /tmp/telegram-bot-api-build \
-    && cd /tmp/telegram-bot-api-build \
-    && cmake -DCMAKE_BUILD_TYPE=Release /tmp/telegram-bot-api-src \
-    && make -j$(nproc) \
-    && cp telegram-bot-api /usr/local/bin/ \
-    && rm -rf /tmp/telegram-bot-api-src /tmp/telegram-bot-api-build
+RUN git clone --recursive https://github.com/tdlib/telegram-bot-api.git && \
+    cd telegram-bot-api && \
+    mkdir build && \
+    cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release .. && \
+    cmake --build . --target install && \
+    cd ../.. && \
+    rm -rf telegram-bot-api
+
 
 # ===== Install Python dependencies =====
 COPY requirements.txt .
