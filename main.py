@@ -13,7 +13,7 @@ from datetime import datetime
 # ===== CONFIG =====
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_BASE = "https://terabox.itxarshman.workers.dev/api"
-MAX_SIZE = 50 * 1024 * 1024           # 50MB (Telegram API limit for videos)
+MAX_SIZE = 2000 * 1024 * 1024           # 50MB (Telegram API limit for videos)
 MAX_CONCURRENT_LINKS = 50          # Max links processed at once
 CHUNK_SIZE = 1024 * 1024           # 1MB chunks (optimal for high-speed I/O)
 TIMEOUT = 120                      # Seconds
