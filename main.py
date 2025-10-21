@@ -11,17 +11,18 @@ from pymongo import MongoClient
 from datetime import datetime
 
 # ===== CONFIG =====
-BOT_TOKEN = os.getenv('BOT_TOKEN')  # Changed to env var
-API_BASE = os.getenv('API_BASE', "https://terabox.itxarshman.workers.dev/api")  # Changed to env var
-MAX_SIZE = 2000 * 1024 * 1024  # Changed to 2000MB (local Bot API limit)
-MAX_CONCURRENT_LINKS = 50          # Max links processed at once
-CHUNK_SIZE = 1024 * 1024           # 1MB chunks (optimal for high-speed I/O)
-TIMEOUT = 120                      # Seconds
-MAX_DOWNLOAD_RETRIES = 3           # Max retries for download with fresh API calls
+BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
+API_BASE = "https://terabox.itxarshman.workers.dev/api"
+LOCAL_API_SERVER = "http://localhost:8081"  # Local Telegram Bot API
+MAX_SIZE = 2000 * 1024 * 1024  # 2GB (local API removes 50MB limit)
+MAX_CONCURRENT_LINKS = 50
+CHUNK_SIZE = 1024 * 1024
+TIMEOUT = 120
+MAX_DOWNLOAD_RETRIES = 3
 # ==================
 
 # ===== MONGODB CONFIG =====
-MONGO_URI = os.getenv('MONGO_URI')  # Changed to env var
+MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
 DB_NAME = "terabox_bot"
 DOWNLOADS_COLLECTION = "downloads"
 FAILED_LINKS_COLLECTION = "failed_links"
@@ -89,7 +90,6 @@ class MongoDBManager:
             result = self.downloads.insert_one(record)
             log.info(f"✅ Recorded success: {file_name}")
             
-            # Remove from failed links if it exists
             self.failed_links.delete_one({
                 "user_id": user_id,
                 "original_link": link
@@ -295,7 +295,6 @@ async def fetch_fresh_direct_url(original_link: str, file_name: str, session: ai
             data = await r.json()
             files = data.get('links', [])
             
-            # Find the matching file by name
             for file_info in files:
                 if file_info.get('name') == file_name:
                     direct_url = file_info.get('direct_url')
@@ -337,18 +336,16 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession, max
 
                     async with aiofiles.open(temp_path, 'ab') as f:
                         downloaded = resume_pos
-                        async for chunk in r.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                        async for chunk in r.content.iter_chunked(1024 * 1024):
                             if chunk:
                                 await f.write(chunk)
                                 hasher.update(chunk)
                                 downloaded += len(chunk)
 
-                    # Verify file size if total is known
                     actual_size = os.path.getsize(temp_path)
                     if total > 0 and actual_size < total:
                         raise ValueError(f"Incomplete download ({actual_size}/{total})")
 
-                    # Rename to final file
                     os.replace(temp_path, path)
                     log_hash = hasher.hexdigest()[:8]
                     logging.info(f"✅ Download complete ({actual_size/1e6:.1f} MB, md5={log_hash})")
@@ -367,10 +364,9 @@ async def download_file(url: str, path: str, session: aiohttp.ClientSession, max
             await asyncio.sleep(2 * attempt)
             continue
 
-    # Cleanup if download fails completely
     if os.path.exists(temp_path):
         os.remove(temp_path)
-    raise RuntimeError(f"Failed after {max_retries} retries — download incomplete.")
+    raise RuntimeError(f"Failed after {max_retries} retries – download incomplete.")
 
 
 async def broadcast_video(file_path: str, video_name: str, update: Update):
@@ -409,7 +405,6 @@ async def upload_and_cleanup(update: Update, path: str, name: str, link: str, si
             else:
                 await update.message.reply_document(document=f)
         
-        # Record success in MongoDB
         if db_manager:
             db_manager.record_success(
                 user_id=update.effective_user.id,
@@ -419,7 +414,6 @@ async def upload_and_cleanup(update: Update, path: str, name: str, link: str, si
                 video_link=path
             )
         
-        # Broadcast video to other chats
         if is_video:
             asyncio.create_task(broadcast_video(path, name, update))
     
@@ -440,7 +434,6 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
     size_mb = file_info.get('size_mb', 0)
     size_bytes = int(size_mb * 1024 * 1024)
     
-    # Get direct_url
     url = file_info.get('direct_url')
 
     if not url:
@@ -461,13 +454,11 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
 
     session = await get_session()
     
-    # Try download with retries and fresh API calls
     for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
         try:
             if attempt > 1:
-                # Fetch fresh direct_url from API for retry attempts
                 log.info(f"🔄 Retry attempt {attempt}/{MAX_DOWNLOAD_RETRIES} for: {name}")
-                await asyncio.sleep(3 * attempt)  # Exponential backoff
+                await asyncio.sleep(3 * attempt)
                 
                 fresh_url, fresh_file_info = await fetch_fresh_direct_url(original_link, name, session)
                 
@@ -478,14 +469,12 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
                     continue
                 
                 url = fresh_url
-                # Update path with new URL hash
                 path = f"/tmp/terabox_{hashlib.md5(url.encode()).hexdigest()}_{safe_name}"
             
             log.info(f"⬇️ [{attempt}/{MAX_DOWNLOAD_RETRIES}] {name} ({size_mb:.1f} MB)")
             await download_file(url, path, session)
             log.info(f"✅ Downloaded: {name}")
             
-            # Upload successful - break retry loop
             await upload_and_cleanup(update, path, name, original_link, size_bytes)
             return
             
@@ -493,7 +482,6 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
             error_msg = str(e)[:200]
             log.error(f"❌ Download failed (attempt {attempt}/{MAX_DOWNLOAD_RETRIES}): {name} – {error_msg}")
             
-            # Clean up partial file
             if os.path.exists(path):
                 try:
                     os.remove(path)
@@ -505,7 +493,6 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
                 except OSError:
                     pass
             
-            # If this was the last attempt, record failure and notify user
             if attempt == MAX_DOWNLOAD_RETRIES:
                 if db_manager:
                     db_manager.record_failure(update.effective_user.id, original_link, error_msg)
@@ -513,7 +500,6 @@ async def process_single_file(update: Update, file_info: dict, original_link: st
                     f"❌ Failed after {MAX_DOWNLOAD_RETRIES} attempts: {name}\n"
                     f"Error: {str(e)[:100]}"
                 )
-            # Otherwise continue to next retry attempt
             continue
 
 
@@ -541,7 +527,6 @@ async def process_link_independently(update: Update, link: str):
 
         log.info(f"📦 {len(files)} file(s) from {link}")
 
-        # Process files one by one
         for file_info in files:
             await process_single_file(update, file_info, link)
 
@@ -586,7 +571,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *Your Download Stats*\n\n"
         f"✅ Successful: `{stats['total_success']}`\n"
         f"❌ Failed: `{stats['total_failed']}`\n"
-        f"🔄 Duplicates: `{dup_status}`\n"
+        f"💾 Total Size: `{stats['total_size_gb']} GB`\n"
+        f"🔄 Duplicates: `{dup_status}`\n\n"
+        f"🚀 *Local API: Unlimited file sizes!*"
     )
     await update.message.reply_text(message, parse_mode="Markdown")
 
@@ -599,10 +586,9 @@ async def failed_links_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     user_id = update.effective_user.id
     
-    # Get count from command args, default to 10
     limit = 10
     if context.args and context.args[0].isdigit():
-        limit = min(int(context.args[0]), 100)  # Max 100 to prevent spam
+        limit = min(int(context.args[0]), 100)
     
     failed = db_manager.get_failed_links(user_id, limit=limit)
     
@@ -627,10 +613,9 @@ async def oversized_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     
-    # Get count from command args, default to 10
     limit = 10
     if context.args and context.args[0].isdigit():
-        limit = min(int(context.args[0]), 100)  # Max 100 to prevent spam
+        limit = min(int(context.args[0]), 100)
     
     oversized = db_manager.get_oversized_links(user_id, limit=limit)
     
@@ -696,15 +681,19 @@ async def duplicate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Ultra-Fast Terabox Bot*\n\n"
-        "📥 Send any Terabox link(s)!\n"
-        "🔄 Auto-retry with fresh URLs on failure\n",
+        "🔥 Send any Terabox link(s)!\n"
+        "🔄 Auto-retry with fresh URLs on failure\n"
+        "🚀 *Local API: No file size limits!*\n"
+        "📦 Supports files up to 2GB\n",
         parse_mode="Markdown"
     )
 
 
 def main():
-    log.info("🚀 Terabox Bot Starting (Smart Retry Enabled)...")
-    app = ApplicationBuilder().token(BOT_TOKEN).base_url("http://telegram-bot-api:8081/bot").build()  # Added base_url for local Bot API
+    log.info("🚀 Terabox Bot Starting (Local API + Smart Retry)...")
+    
+    # Use local API server
+    app = ApplicationBuilder().token(BOT_TOKEN).base_url(LOCAL_API_SERVER).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_command))
