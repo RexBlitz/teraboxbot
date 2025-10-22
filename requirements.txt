@@ -2,3 +2,4 @@ python-telegram-bot==20.5
 aiohttp
 aiofiles
 motor
+aiogram
