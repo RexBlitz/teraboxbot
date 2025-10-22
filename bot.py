@@ -14,7 +14,6 @@ from aiogram.exceptions import TelegramBadRequest
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -49,7 +48,6 @@ admins_col = db["admins"]
 DEFAULT_CONFIG = {
     "_id": "global",
     "admin_broadcast_enabled": False,  # Admin links broadcast
-    "channel_listener_enabled": False,  # Listen to channel posts
     "channel_broadcast_enabled": False,  # Channel links broadcast
     "broadcast_chats": [-1002780909369],
     "admin_password": "11223344"
@@ -60,6 +58,8 @@ bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 router = Router(name="terabox_listener")
 sem = asyncio.Semaphore(50)
+pending_auth = {} # Used for admin password/ID entry
+
 
 async def get_config():
     config = await config_col.find_one({"_id": "global"})
@@ -91,6 +91,7 @@ async def add_admin(user_id: int, username: str = None, full_name: str = None):
 
 async def set_bot_commands(user_id: int = None):
     """Set bot commands based on user role"""
+    # ... (Keep this function as is)
     if user_id and await is_admin(user_id):
         # Admin commands
         commands = [
@@ -104,9 +105,13 @@ async def set_bot_commands(user_id: int = None):
             BotCommand(command="start", description="Start the bot")
         ]
         if user_id:
-            await bot.set_my_commands(commands, scope=types.BotCommandScopeChat(chat_id=user_id))
+            try:
+                 await bot.set_my_commands(commands, scope=types.BotCommandScopeChat(chat_id=user_id))
+            except Exception as e:
+                logger.warning(f"Failed to set commands for user {user_id}: {e}")
         else:
             await bot.set_my_commands(commands)
+
 
 async def get_links(source_url: str):
     logger.info(f"Requesting links for URL: {source_url}")
@@ -121,46 +126,99 @@ async def get_links(source_url: str):
             logger.error(f"Error fetching links for {source_url}: {str(e)}")
     return None
 
-async def download_file(dl_url: str, filename: str, size_mb: float, attempt: int = 0):
+async def download_file(dl_url: str, filename: str, size_mb: float, status_message: Message, attempt: int = 0):
+    """
+    Downloads the file and updates the status_message with progress.
+    """
     path = tempfile.NamedTemporaryFile(delete=False).name
     downloaded = 0
+    start_time = time.time()
+    last_update_time = 0
+    
     logger.info(f"Starting download of {filename} from {dl_url} (attempt {attempt + 1})")
+    
     try:
         async with sem:
             async with aiohttp.ClientSession() as session:
                 async with session.get(dl_url) as resp:
                     if resp.status != 200:
                         logger.error(f"Download failed for {filename}, status: {resp.status}")
-                        return False, None
+                        raise Exception(f"HTTP Status {resp.status}")
+                        
                     content_length = int(resp.headers.get('Content-Length', 0))
                     total_mb = content_length / (1024 * 1024) if content_length else size_mb
+                    
+                    # 5MB chunk size for downloading
                     async for chunk in resp.content.iter_chunked(5 * 1024 * 1024):
                         with open(path, 'ab') as f:
                             f.write(chunk)
                         downloaded += len(chunk)
-                        if downloaded % (50 * 1024 * 1024) == 0:
+                        
+                        # Update progress every 5 seconds to avoid rate limits
+                        if time.time() - last_update_time > 5:
+                            
+                            elapsed = time.time() - start_time
+                            speed_bps = (downloaded / elapsed) if elapsed > 0 else 0
+                            speed_mbps = speed_bps / (1024 * 1024)
+                            
                             percent = (downloaded / (total_mb * 1024 * 1024)) * 100 if total_mb else 0
-                            logger.info(f"Downloading {filename}: {downloaded // (1024 * 1024)}/{int(total_mb)} MB ({percent:.0f}%)")
+                            
+                            progress_text = (
+                                f"📥 **Downloading** `{filename}`\n"
+                                f"📦 Size: **{total_mb:.2f} MB**\n"
+                                f"⬇️ Progress: **{downloaded / (1024 * 1024):.2f}/{total_mb:.2f} MB** (**{percent:.0f}%**)\n"
+                                f"⚡ Speed: **{speed_mbps:.2f} MB/s**"
+                            )
+                            
+                            try:
+                                await bot.edit_message_text(
+                                    chat_id=status_message.chat.id, 
+                                    message_id=status_message.message_id, 
+                                    text=progress_text,
+                                    parse_mode="Markdown"
+                                )
+                                last_update_time = time.time()
+                            except TelegramBadRequest as e:
+                                # Ignore "Message is not modified" errors
+                                if "message is not modified" not in str(e):
+                                    logger.error(f"Telegram update error: {e}")
+                                
                     logger.info(f"Download completed for {filename}")
+    
     except Exception as e:
         logger.error(f"Download error for {filename}: {str(e)}")
         if os.path.exists(path):
             os.unlink(path)
+        
         if attempt < 2:
             backoff = 2 ** attempt
             logger.info(f"Retrying download for {filename} after {backoff}s")
             await asyncio.sleep(backoff)
-            return await download_file(dl_url, filename, size_mb, attempt + 1)
+            return await download_file(dl_url, filename, size_mb, status_message, attempt + 1)
+        
+        # If all attempts fail, update the message with a failure notice
+        try:
+            await status_message.edit_text(f"❌ Failed to download {filename} after {attempt+1} attempts.")
+        except:
+            pass
         return False, None
+    
+    # After successful download, delete the status message before sending the video
+    try:
+        await bot.delete_message(status_message.chat.id, status_message.message_id)
+    except:
+        pass # Ignore failure to delete if message was already gone
+        
     return True, path
 
+# ... (Keep broadcast_video, send_video_to_user as is)
 async def broadcast_video(file_path: str, video_name: str, broadcast_type: str):
     """
     Broadcast video to configured chats
     broadcast_type: 'admin' or 'channel'
     """
     config = await get_config()
-    
+    # ... (Keep the rest of the original broadcast_video logic)
     # Check if broadcasting is enabled for this type
     if broadcast_type == 'admin' and not config["admin_broadcast_enabled"]:
         logger.info(f"Admin broadcast disabled - skipping {video_name}")
@@ -207,7 +265,7 @@ async def send_video_to_user(file_path: str, video_name: str, chat_id: int):
         logger.error(f"❌ Failed to send to chat {chat_id}: {str(e)[:100]}")
         return False
 
-async def process_file(link: dict, source_url: str, original_chat_id: int = None, source_type: str = "user"):
+async def process_file(link: dict, source_url: str, original_chat_id: int = None, source_type: str = "user", status_message: Message = None):
     """
     Process and download file
     source_type: 'user' (regular user), 'admin' (admin user), 'channel' (channel post)
@@ -217,24 +275,35 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
     size_gb = size_mb / 1024
     logger.info(f"Processing file: {name}, size: {size_mb} MB, source: {source_type}")
     
-    if size_gb > 2:
-        logger.warning(f"File {name} size {size_gb:.2f} GB exceeds 2 GB limit")
-        if original_chat_id and source_type != "channel":
-            await bot.send_message(original_chat_id, f"❌ File {name} is too large ({size_gb:.2f} GB). Max 2 GB.")
-        return
+    # Pre-checks (Only for non-channel)
+    if source_type != "channel":
+        if size_gb > 2:
+            logger.warning(f"File {name} size {size_gb:.2f} GB exceeds 2 GB limit")
+            if status_message:
+                await status_message.edit_text(f"❌ File `{name}` is too large (**{size_gb:.2f} GB**). Max 2 GB.", parse_mode="Markdown")
+            return
 
-    # Only process videos
-    if not name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
-        logger.info(f"Skipping non-video file: {name}")
-        if original_chat_id and source_type != "channel":
-            await bot.send_message(original_chat_id, f"ℹ️ Skipped non-video file: {name}")
-        return
+        # Only process videos
+        if not name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
+            logger.info(f"Skipping non-video file: {name}")
+            if status_message:
+                await status_message.edit_text(f"ℹ️ Skipped non-video file: `{name}`. Only video files are processed.", parse_mode="Markdown")
+            return
 
     file_path = None
     new_link = None
+    
+    # If it's a channel post and checks passed (or no status_message), send a placeholder
+    if not status_message and original_chat_id and source_type != "channel":
+        status_message = await bot.send_message(original_chat_id, f"🔍 Found: `{name}`. Initializing download...", parse_mode="Markdown")
+    
+    # If a channel post, we don't send a status message, we just process silently
+    if source_type == "channel":
+        logger.info(f"Silently processing channel file: {name}")
+
+
     async with sem:
         try:
-            # Download attempt logic (same as old version)
             for attempt in range(4):
                 if attempt == 0:
                     dl_url = link["original_url"]
@@ -263,20 +332,23 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
                     break
                 
                 logger.info(f"Attempting {label} download for {name}")
-                success, file_path = await download_file(dl_url, name, size_mb)
+                # Pass the status message for progress updates
+                success, file_path = await download_file(dl_url, name, size_mb, status_message)
                 if success:
                     break
                 logger.warning(f"{label.capitalize()} failed for {name}, retrying...")
 
             if not file_path:
                 logger.error(f"File {name} failed to download after all retries")
-                if original_chat_id and source_type != "channel":
-                    await bot.send_message(original_chat_id, f"❌ Failed to download {name}")
+                # If no status message (channel), log only
+                if status_message and source_type != "channel":
+                    # download_file already updated the message with failure
+                    pass
                 return
 
             logger.info(f"Successfully downloaded {name}")
 
-            # Handle based on source type (same logic as before)
+            # Handle based on source type
             if source_type == "user":
                 # Regular user - just send video back
                 await send_video_to_user(file_path, name, original_chat_id)
@@ -292,6 +364,8 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
 
         except Exception as e:
             logger.error(f"Error processing {name}: {str(e)}")
+            if status_message and source_type != "channel":
+                await status_message.edit_text(f"❌ An error occurred while processing `{name}`.", parse_mode="Markdown")
         finally:
             if file_path and os.path.exists(file_path):
                 logger.debug(f"Cleaning up temporary file: {file_path}")
@@ -311,15 +385,31 @@ async def process_url(source_url: str, chat_id: int, source_type: str = "user"):
             await bot.send_message(chat_id, f"❌ Failed to retrieve links for {source_url}")
         return
 
-    logger.info(f"Found {len(response['links'])} files for {source_url}")
-    if source_type != "channel":
-        await bot.send_message(chat_id, f"📥 Found {len(response['links'])} file(s). Downloading...")
+    links = [link for link in response["links"] if link.get("name", "").lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))]
+    non_video_count = len(response["links"]) - len(links)
     
-    for link in response["links"]:
-        asyncio.create_task(process_file(link, source_url, chat_id, source_type))
+    logger.info(f"Found {len(links)} video files for {source_url}")
+    
+    if source_type != "channel":
+        
+        if len(links) == 0:
+            await bot.send_message(chat_id, f"⚠️ Found no video files in the link.")
+        else:
+            await bot.send_message(chat_id, f"📥 Found **{len(links)}** video file(s) and **{non_video_count}** other file(s). Starting downloads...", parse_mode="Markdown")
+
+    for link in links:
+        # For non-channel posts, send an initial message to be used for progress updates
+        status_message = None
+        if source_type != "channel":
+            name = link.get("name", "unknown")
+            status_message = await bot.send_message(chat_id, f"🔍 Found: `{name}`. Initializing download...", parse_mode="Markdown")
+            
+        asyncio.create_task(process_file(link, source_url, chat_id, source_type, status_message))
+
 
 @router.message(Command("start"))
 async def start(message: Message):
+    # ... (Keep this function as is)
     logger.info(f"Start command received from user {message.from_user.id}")
     user_is_admin = await is_admin(message.from_user.id)
     
@@ -337,6 +427,7 @@ async def start(message: Message):
     
     await message.answer(welcome_msg, parse_mode="Markdown")
 
+
 @router.message(Command("settings"))
 async def settings_command(message: Message):
     user_id = message.from_user.id
@@ -349,19 +440,15 @@ async def settings_command(message: Message):
         pending_auth[user_id] = "awaiting_password"
         await message.answer("🔐 Enter admin password to access settings:")
 
-pending_auth = {}
 
 async def show_settings(message: Message):
+    # ... (Keep this function as is)
     """Show settings menu to admin"""
     config = await get_config()
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text=f"📡 Admin Broadcast: {'✅ ON' if config['admin_broadcast_enabled'] else '❌ OFF'}",
             callback_data="toggle_admin_broadcast"
-        )],
-        [InlineKeyboardButton(
-            text=f"👂 Channel Listener: {'✅ ON' if config['channel_listener_enabled'] else '❌ OFF'}",
-            callback_data="toggle_channel_listener"
         )],
         [InlineKeyboardButton(
             text=f"📺 Channel Broadcast: {'✅ ON' if config['channel_broadcast_enabled'] else '❌ OFF'}",
@@ -372,26 +459,35 @@ async def show_settings(message: Message):
             callback_data="set_broadcast_id"
         )],
     ])
-    await message.answer(
-        build_settings_text(config),
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-
+    try:
+        await message.answer(
+            build_settings_text(config),
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    except TelegramBadRequest as e:
+        # This handles cases where settings is called via /settings and then via a password
+        if "message is not modified" not in str(e):
+             await message.answer(
+                build_settings_text(config),
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        
 def build_settings_text(config):
+    # ... (Keep this function as is)
     return (
         f"⚙️ **Bot Settings**\n\n"
         f"📡 Admin Broadcast: {'✅ Enabled' if config['admin_broadcast_enabled'] else '❌ Disabled'}\n"
-        f"   _(When enabled, videos from admin links are broadcasted)_\n\n"
-        f"👂 Channel Listener: {'✅ Enabled' if config['channel_listener_enabled'] else '❌ Disabled'}\n"
-        f"   _(When enabled, bot listens to channel posts)_\n\n"
+        f"  _(When enabled, videos from admin links are broadcasted)_\n\n"
         f"📺 Channel Broadcast: {'✅ Enabled' if config['channel_broadcast_enabled'] else '❌ Disabled'}\n"
-        f"   _(When enabled, videos from channel posts are broadcasted)_\n\n"
+        f"  _(When enabled, videos from channel posts are broadcasted)_\n\n"
         f"🆔 Broadcast Chats: {', '.join(map(str, config['broadcast_chats'])) if config['broadcast_chats'] else 'None'}"
     )
 
 @router.callback_query()
 async def settings_callback(callback: CallbackQuery):
+    # ... (Keep this function as is)
     user_id = callback.from_user.id
     data = callback.data
 
@@ -407,11 +503,6 @@ async def settings_callback(callback: CallbackQuery):
         await update_config({"admin_broadcast_enabled": new_state})
         await update_settings_message(callback, "📡 Admin Broadcast", new_state)
 
-    elif data == "toggle_channel_listener":
-        new_state = not config["channel_listener_enabled"]
-        await update_config({"channel_listener_enabled": new_state})
-        await update_settings_message(callback, "👂 Channel Listener", new_state)
-
     elif data == "toggle_channel_broadcast":
         new_state = not config["channel_broadcast_enabled"]
         await update_config({"channel_broadcast_enabled": new_state})
@@ -423,6 +514,7 @@ async def settings_callback(callback: CallbackQuery):
         await callback.answer()
 
 async def update_settings_message(callback: CallbackQuery, label: str, state: bool):
+    # ... (Keep this function as is)
     """Update settings message with new config"""
     config = await get_config()
 
@@ -430,10 +522,6 @@ async def update_settings_message(callback: CallbackQuery, label: str, state: bo
         [InlineKeyboardButton(
             text=f"📡 Admin Broadcast: {'✅ ON' if config['admin_broadcast_enabled'] else '❌ OFF'}",
             callback_data="toggle_admin_broadcast"
-        )],
-        [InlineKeyboardButton(
-            text=f"👂 Channel Listener: {'✅ ON' if config['channel_listener_enabled'] else '❌ OFF'}",
-            callback_data="toggle_channel_listener"
         )],
         [InlineKeyboardButton(
             text=f"📺 Channel Broadcast: {'✅ ON' if config['channel_broadcast_enabled'] else '❌ OFF'}",
@@ -457,6 +545,10 @@ async def handle_message(message: Message):
     user_id = message.from_user.id
     text = (message.text or message.caption or "").strip()
     
+    # Check for commands explicitly to prevent interference (e.g. if user types /start in password entry)
+    if text.startswith("/"):
+        return
+
     # Handle password authentication
     if user_id in pending_auth:
         state = pending_auth[user_id]
@@ -478,7 +570,7 @@ async def handle_message(message: Message):
                 # Show settings
                 await show_settings(message)
             else:
-                await message.answer("❌ Wrong password.")
+                await message.answer("❌ Wrong password. Try /settings again.")
                 del pending_auth[user_id]
             return
         
@@ -489,6 +581,8 @@ async def handle_message(message: Message):
                 await update_config({"broadcast_chats": ids})
                 await message.answer(f"✅ Updated broadcast chats: {ids}")
                 del pending_auth[user_id]
+                # Show updated settings menu
+                await show_settings(message)
             except ValueError:
                 await message.answer("❌ Invalid format. Please enter numeric chat IDs separated by commas.")
                 del pending_auth[user_id]
@@ -497,6 +591,7 @@ async def handle_message(message: Message):
     # Handle TeraBox URLs
     urls = LINK_REGEX.findall(text)
     if not urls:
+        # If the message is not a command, not an admin password, and contains no links, ignore it silently.
         return
 
     chat_id = message.chat.id
@@ -510,18 +605,16 @@ async def handle_message(message: Message):
     for url in urls:
         url = url.rstrip('.,!?')
         logger.info(f"Processing {source_type} URL: {url}")
+        # Process the URL to find links and start tasks
         asyncio.create_task(process_url(url, chat_id, source_type))
 
 @router.channel_post()
 async def handle_channel_post(message: Message):
-    """Handle channel posts - only if channel listener AND broadcast are enabled"""
+    # ... (Keep this function as is, it's correct for silent channel processing)
+    """Handle channel posts - only if channel broadcast is enabled"""
     config = await get_config()
     
-    # Only listen to channel if BOTH channel listener and broadcast are enabled
-    if not config["channel_listener_enabled"]:
-        logger.debug("Channel listener disabled - ignoring channel post")
-        return
-    
+    # Only listen to channel if channel broadcast is enabled
     if not config["channel_broadcast_enabled"]:
         logger.debug("Channel broadcast disabled - ignoring channel post")
         return
@@ -537,6 +630,7 @@ async def handle_channel_post(message: Message):
     for url in urls:
         url = url.rstrip('.,!?')
         logger.info(f"📥 Processing channel URL: {url}")
+        # Process URL without sending status messages (status_message=None in process_file)
         asyncio.create_task(process_url(url, chat_id, "channel"))
 
 # Attach router
