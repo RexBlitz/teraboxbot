@@ -36,8 +36,8 @@ API_ENDPOINT = "https://terabox.itxarshman.workers.dev/api"
 SELF_HOSTED_API = "http://tgapi.arshman.space:8088"
 
 # Feature flags
-ENABLE_BROADCAST = True  # Set to False to disable broadcasting videos
-ENABLE_CHANNEL_LISTENER = True  # Set to False to disable processing links from channels
+ENABLE_BROADCAST = false  # Set to False to disable broadcasting videos
+ENABLE_CHANNEL_LISTENER = false  # Set to False to disable processing links from channels
 
 # Broadcast configuration
 BROADCAST_CHATS = [ -1002780909369, ]  # Add chat IDs here, e.g., [123456789, 987654321]
