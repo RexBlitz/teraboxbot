@@ -12,10 +12,6 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramBadRequest
 
-from aiogram.enums import ChatType
-from aiogram.filters import CommandStart
-from aiogram import F
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +38,7 @@ BROADCAST_CHATS = [ -1002780909369, ]  # Add chat IDs here, e.g., [123456789, 98
 session = AiohttpSession(api=TelegramAPIServer.from_base(SELF_HOSTED_API))
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
-router = Router(name="terabox_listener")
+router = Router()
 sem = asyncio.Semaphore(50)  # 50 concurrent connections
 
 async def get_links(source_url: str):
@@ -231,30 +227,20 @@ async def process_url(source_url: str, chat_id: int):
     for link in response["links"]:
         asyncio.create_task(process_file(link, source_url, chat_id))
 
-# Handle /start command (for PMs)
-@router.message(CommandStart())
-async def start(message: Message):
-    await message.answer("👋 Send me any TeraBox link — I’ll download it automatically.")
-
-# Handle messages in all chat types (private, groups, supergroups, channels)
-@router.message(F.chat.type.in_({ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}))
+@router.message()
 async def handle_message(message: Message):
-    # Handle both regular messages and channel posts
     text = (message.text or message.caption or "")
     urls = LINK_REGEX.findall(text)
     if not urls:
         logger.debug("No valid TeraBox URLs found in message")
         return
-
     chat_id = message.chat.id
-    sender = getattr(message.from_user, "full_name", "Unknown") if message.from_user else "Channel"
-    logger.info(f"Detected TeraBox URL(s) in chat {chat_id} from {sender}")
-
     for url in urls:
-        url = url.rstrip('.,!?')
-        logger.info(f"Found URL: {url}")
+        url = url.rstrip('.,!?')  # Clean trailing punctuation
+        logger.info(f"Found URL in message: {url}")
         asyncio.create_task(process_url(url, chat_id))
-# Handle channel posts specifically
+
+
 @router.channel_post()
 async def handle_channel_post(message: Message):
     text = (message.text or message.caption or "")
@@ -272,10 +258,13 @@ async def handle_channel_post(message: Message):
         asyncio.create_task(process_url(url, chat_id))
 
 
-# Attach router to dispatcher
+@router.message(Command("start"))
+async def start(message: Message):
+    logger.info(f"Start command received from chat ID: {message.chat.id}")
+    await message.answer("Send me TeraBox links to download videos.")
+
 dp.include_router(router)
 
-# Start polling
 if __name__ == "__main__":
-    logger.info("🚀 Starting TeraDownloader bot (with group/channel listener)")
-    asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
+    logger.info("Starting TeraDownloader bot")
+    asyncio.run(dp.start_polling(bot))
