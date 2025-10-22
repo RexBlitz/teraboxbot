@@ -58,7 +58,7 @@ bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 router = Router(name="terabox_listener")
 sem = asyncio.Semaphore(50)
-pending_auth = {} # Used for admin password/ID entry
+pending_auth = {}
 
 
 async def get_config():
@@ -69,12 +69,10 @@ async def get_config():
     config = await config_col.find_one({"_id": "global"})
     
     if not config:
-        # No config found: insert default and return it
         await config_col.insert_one(DEFAULT_CONFIG)
         logger.info("Inserted new global configuration.")
         return DEFAULT_CONFIG
     
-    # Config found: check for missing keys and merge
     needs_update = False
     for key, default_value in DEFAULT_CONFIG.items():
         if key not in config:
@@ -82,9 +80,7 @@ async def get_config():
             needs_update = True
             logger.warning(f"Config missing key '{key}'. Added default value: {default_value}")
     
-    # If keys were missing, update the database document
     if needs_update:
-        # Use update_one to save the merged dictionary back to MongoDB
         await config_col.update_one({"_id": "global"}, {"$set": {k: v for k, v in config.items() if k != "_id"}})
         logger.info("Updated existing global configuration with missing keys.")
         
@@ -117,21 +113,17 @@ async def set_bot_commands(user_id: int = None):
     is_user_admin = user_id and await is_admin(user_id)
     
     if is_user_admin:
-        # Admin commands
         commands = [
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="settings", description="Bot Settings (Admin Only)")
         ]
-        # Set commands specifically for the admin user
         await bot.set_my_commands(commands, scope=types.BotCommandScopeChat(chat_id=user_id))
     
-    # Set default commands globally (only /start)
     if not user_id:
         commands = [
             BotCommand(command="start", description="Start the bot")
         ]
         await bot.set_my_commands(commands)
-    # If user_id is provided but they're not admin, also set the regular user commands
     elif user_id and not is_user_admin:
         commands = [
             BotCommand(command="start", description="Start the bot")
@@ -173,14 +165,12 @@ async def download_file(dl_url: str, filename: str, size_mb: float, status_messa
                     content_length = int(resp.headers.get('Content-Length', 0))
                     total_mb = content_length / (1024 * 1024) if content_length else size_mb
                     
-                    # 5MB chunk size for downloading
                     async for chunk in resp.content.iter_chunked(5 * 1024 * 1024):
                         with open(path, 'ab') as f:
                             f.write(chunk)
                         downloaded += len(chunk)
                         
-                        # Update progress every 5 seconds to avoid rate limits
-                        if time.time() - last_update_time > 5:
+                        if time.time() - last_update_time > 5 and status_message:
                             
                             elapsed = time.time() - start_time
                             speed_bps = (downloaded / elapsed) if elapsed > 0 else 0
@@ -220,7 +210,6 @@ async def download_file(dl_url: str, filename: str, size_mb: float, status_messa
             await asyncio.sleep(backoff)
             return await download_file(dl_url, filename, size_mb, status_message, attempt + 1)
         
-        # If all attempts fail, update the message with a failure notice
         if status_message:
             try:
                 await status_message.edit_text(f"❌ Failed to download `{filename}` after {attempt+1} attempts.", parse_mode="Markdown")
@@ -228,20 +217,15 @@ async def download_file(dl_url: str, filename: str, size_mb: float, status_messa
                 pass
         return False, None
     
-    # After successful download, delete the status message before sending the video
     if status_message:
         try:
             await bot.delete_message(status_message.chat.id, status_message.message_id)
         except:
-            pass # Ignore failure to delete if message was already gone
+            pass 
             
     return True, path
 
 async def broadcast_video(file_path: str, video_name: str, broadcast_type: str):
-    """
-    Broadcast video to configured chats
-    broadcast_type: 'admin' or 'channel'
-    """
     config = await get_config()
     
     if broadcast_type == 'admin' and not config["admin_broadcast_enabled"]:
@@ -278,10 +262,11 @@ async def broadcast_video(file_path: str, video_name: str, broadcast_type: str):
     return False
 
 async def send_video_to_user(file_path: str, video_name: str, chat_id: int):
-    """Send video directly to user"""
+    """Send video directly to user with cleaned caption."""
     try:
         input_file = FSInputFile(file_path, filename=video_name)
-        await bot.send_video(chat_id=chat_id, video=input_file, supports_streaming=True, caption=f"✅ {video_name}")
+        # Caption is just the video name
+        await bot.send_video(chat_id=chat_id, video=input_file, supports_streaming=True, caption=video_name)
         logger.info(f"📤 Sent {video_name} to chat {chat_id}")
         return True
     except Exception as e:
@@ -290,15 +275,14 @@ async def send_video_to_user(file_path: str, video_name: str, chat_id: int):
 
 async def process_file(link: dict, source_url: str, original_chat_id: int = None, source_type: str = "user", status_message: Message = None):
     """
-    Process and download file
-    source_type: 'user' (regular user), 'admin' (admin user), 'channel' (channel post)
+    Process and download file. If status_message is provided, it will be edited for progress.
     """
     name = link.get("name", "unknown")
     size_mb = link.get("size_mb", 0)
     size_gb = size_mb / 1024
     logger.info(f"Processing file: {name}, size: {size_mb} MB, source: {source_type}")
     
-    # Pre-checks (Only for non-channel, when we have a status message to edit)
+    # Pre-checks only for user/admin inputs with a message to edit
     if status_message and source_type != "channel":
         if size_gb > 2:
             logger.warning(f"File {name} size {size_gb:.2f} GB exceeds 2 GB limit")
@@ -310,6 +294,7 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
             await status_message.edit_text(f"ℹ️ Skipped non-video file: `{name}`. Only video files are processed.", parse_mode="Markdown")
             return
             
+        # Initial edit to confirm file processing
         await status_message.edit_text(f"📥 Found: `{name}`. Starting download...", parse_mode="Markdown")
 
     file_path = None
@@ -324,7 +309,6 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
                 elif attempt == 1:
                     dl_url = link["direct_url"]
                     label = "direct fallback"
-                # ... (rest of the link refresh logic remains the same)
                 elif attempt == 2:
                     logger.info(f"Refreshing links for {name}")
                     new_resp = await get_links(source_url)
@@ -346,7 +330,6 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
                     break
 
                 logger.info(f"Attempting {label} download for {name}")
-                # Pass the status message for progress updates
                 success, file_path = await download_file(dl_url, name, size_mb, status_message)
                 if success:
                     break
@@ -354,12 +337,10 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
 
             if not file_path:
                 logger.error(f"File {name} failed to download after all retries")
-                # download_file already updated the message with failure
                 return
 
             logger.info(f"Successfully downloaded {name}")
 
-            # Handle based on source type
             if source_type == "user":
                 await send_video_to_user(file_path, name, original_chat_id)
             
@@ -381,7 +362,7 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
 
 async def process_url(source_url: str, chat_id: int, source_type: str = "user"):
     """
-    Process TeraBox URL
+    Process TeraBox URL. Creates a dedicated status message for each file for editing.
     """
     logger.info(f"Processing URL: {source_url} from {source_type} {chat_id}")
     response = await get_links(source_url)
@@ -400,15 +381,15 @@ async def process_url(source_url: str, chat_id: int, source_type: str = "user"):
     if source_type != "channel":
         if len(links) == 0:
             await bot.send_message(chat_id, f"⚠️ Found no video files in the link.")
-        else:
-            await bot.send_message(chat_id, f"📥 Found **{len(links)}** video file(s) and **{non_video_count}** other file(s). Preparing to download...", parse_mode="Markdown")
-
+        # Removed the general 'Found X files and Y others...' message
+        
     for link in links:
         status_message = None
         
         # Only create a status message for user/admin to edit. Channel posts are silent.
         if source_type != "channel":
             name = link.get("name", "unknown")
+            # This is the single message that will be edited for progress
             status_message = await bot.send_message(chat_id, f"🔍 **Processing:** `{name}`. Initializing...", parse_mode="Markdown")
             
         asyncio.create_task(process_file(link, source_url, chat_id, source_type, status_message))
@@ -469,7 +450,6 @@ async def show_settings(message: Message):
             parse_mode="Markdown"
         )
     except TelegramBadRequest:
-        # Gracefully handle the case if the message is already sent (e.g. from password entry)
         pass 
         
 def build_settings_text(config):
@@ -542,7 +522,6 @@ async def handle_message(message: Message):
     if text.startswith("/"):
         return
 
-    # Handle password authentication
     if user_id in pending_auth:
         state = pending_auth[user_id]
         config = await get_config()
@@ -551,7 +530,6 @@ async def handle_message(message: Message):
             if text == config["admin_password"]:
                 await add_admin(user_id, message.from_user.username, message.from_user.full_name)
                 await message.answer("✅ Password accepted! You are now an admin.")
-                # Crucial for /settings to show up in the menu
                 await set_bot_commands(user_id) 
                 del pending_auth[user_id]
                 await show_settings(message)
@@ -572,7 +550,6 @@ async def handle_message(message: Message):
                 del pending_auth[user_id]
             return
     
-    # Handle TeraBox URLs
     urls = LINK_REGEX.findall(text)
     if not urls:
         return
@@ -613,10 +590,8 @@ async def handle_channel_post(message: Message):
 # Attach router
 dp.include_router(router)
 
-# Start bot
 if __name__ == "__main__":
     async def main():
-        # Ensure config is ready and base commands are set before polling starts
         await get_config()
         await set_bot_commands()  
         logger.info("🚀 Starting TeraDownloader bot")
