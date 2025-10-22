@@ -403,14 +403,11 @@ async def start(message: Message):
     welcome_msg = "🤖 **TeraBox Downloader Bot**\n\n"
     if user_is_admin:
         welcome_msg += "👑 Welcome back, Admin!\n\n"
-        welcome_msg += "📌 **Admin Features:**\n"
         welcome_msg += "• Send TeraBox links to download videos\n"
         welcome_msg += "• Use /settings to configure bot\n"
-        welcome_msg += "• Configure admin & channel broadcasting\n\n"
     else:
         welcome_msg += "📥 Send me TeraBox links and I'll download videos for you!\n\n"
-        welcome_msg += "🔐 **Admin Access:**\n"
-        welcome_msg += "If you're an admin, type /settings to unlock admin features."
+
     
     await message.answer(welcome_msg, parse_mode="Markdown")
 
