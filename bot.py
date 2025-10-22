@@ -34,12 +34,18 @@ LINK_REGEX = re.compile(
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_ENDPOINT = "https://terabox.itxarshman.workers.dev/api"
 SELF_HOSTED_API = "http://tgapi.arshman.space:8088"
-BROADCAST_CHATS = []# -1002780909369, ]  # Add chat IDs here, e.g., [123456789, 987654321]
+
+# Feature flags
+ENABLE_BROADCAST = True  # Set to False to disable broadcasting videos
+ENABLE_CHANNEL_LISTENER = True  # Set to False to disable processing links from channels
+
+# Broadcast configuration
+BROADCAST_CHATS = [ -1002780909369, ]  # Add chat IDs here, e.g., [123456789, 987654321]
 
 session = AiohttpSession(api=TelegramAPIServer.from_base(SELF_HOSTED_API))
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
-router = Router()
+router = Router(name="terabox_listener")
 sem = asyncio.Semaphore(50)  # 50 concurrent connections
 
 async def get_links(source_url: str):
@@ -89,6 +95,9 @@ async def download_file(dl_url: str, filename: str, size_mb: float, attempt: int
     return True, path
 
 async def broadcast_video(file_path: str, video_name: str):
+    if not ENABLE_BROADCAST:
+        logger.info(f"Broadcast disabled - skipping {video_name}")
+        return
     if not BROADCAST_CHATS:
         logger.warning("No broadcast chats configured")
         return
@@ -215,6 +224,16 @@ async def handle_message(message: Message):
 # Handle channel posts - silent processing only
 @router.channel_post()
 async def handle_channel_post(message: Message):
+    # Check if channel listener is enabled
+    if not ENABLE_CHANNEL_LISTENER:
+        logger.debug("Channel listener disabled - ignoring channel post")
+        return
+
+    # Check if broadcast is enabled and configured
+    if not ENABLE_BROADCAST or not BROADCAST_CHATS:
+        logger.warning("Channel processing requires ENABLE_BROADCAST=True and configured BROADCAST_CHATS - ignoring channel post")
+        return
+
     text = (message.text or message.caption or "")
     urls = LINK_REGEX.findall(text)
     if not urls:
@@ -236,5 +255,11 @@ dp.include_router(router)
 
 # Start polling
 if __name__ == "__main__":
-    logger.info("🚀 Starting TeraDownloader bot (with silent channel listener)")
+    logger.info("🚀 Starting TeraDownloader bot")
+    logger.info(f"📡 Channel Listener: {'ENABLED' if ENABLE_CHANNEL_LISTENER else 'DISABLED'}")
+    logger.info(f"📤 Broadcast: {'ENABLED' if ENABLE_BROADCAST else 'DISABLED'}")
+    if ENABLE_BROADCAST:
+        logger.info(f"📋 Broadcast Chats: {BROADCAST_CHATS}")
+    if ENABLE_CHANNEL_LISTENER and (not ENABLE_BROADCAST or not BROADCAST_CHATS):
+        logger.warning("⚠️  Channel listener enabled but broadcast is disabled or not configured - channel posts will be ignored")
     asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
