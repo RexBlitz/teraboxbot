@@ -38,7 +38,7 @@ API_ENDPOINT = "https://terabox.itxarshman.workers.dev/api"
 SELF_HOSTED_API = "http://tgapi.arshman.space:8088"
 
 # MongoDB setup
-MONGO_URI = "mongodb://localhost:27017"
+MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["teradownloader"]
 config_col = db["config"]
