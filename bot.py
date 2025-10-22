@@ -239,6 +239,7 @@ async def start(message: Message):
 # Handle messages in all chat types (private, groups, supergroups, channels)
 @router.message(F.chat.type.in_({ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL}))
 async def handle_message(message: Message):
+    # Handle both regular messages and channel posts
     text = (message.text or message.caption or "")
     urls = LINK_REGEX.findall(text)
     if not urls:
