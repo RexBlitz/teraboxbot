@@ -62,10 +62,32 @@ pending_auth = {} # Used for admin password/ID entry
 
 
 async def get_config():
+    """
+    Retrieves global config, creating the default if none exists,
+    or merging with defaults to ensure all keys are present.
+    """
     config = await config_col.find_one({"_id": "global"})
+    
     if not config:
+        # No config found: insert default and return it
         await config_col.insert_one(DEFAULT_CONFIG)
+        logger.info("Inserted new global configuration.")
         return DEFAULT_CONFIG
+    
+    # Config found: check for missing keys and merge
+    needs_update = False
+    for key, default_value in DEFAULT_CONFIG.items():
+        if key not in config:
+            config[key] = default_value
+            needs_update = True
+            logger.warning(f"Config missing key '{key}'. Added default value: {default_value}")
+    
+    # If keys were missing, update the database document
+    if needs_update:
+        # Use update_one to save the merged dictionary back to MongoDB
+        await config_col.update_one({"_id": "global"}, {"$set": {k: v for k, v in config.items() if k != "_id"}})
+        logger.info("Updated existing global configuration with missing keys.")
+        
     return config
 
 async def update_config(update: dict):
