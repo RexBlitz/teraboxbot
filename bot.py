@@ -25,14 +25,14 @@ logger = logging.getLogger(__name__)
 
 # TeraBox-specific URL regex
 LINK_REGEX = re.compile(
-    r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink)\.[^\s]+",
+    r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink|teraboxurl)\.[^\s]+",
     re.IGNORECASE
 )
 
 # Configuration
 BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_ENDPOINT = "https://terabox.itxarshman.workers.dev/api"
-SELF_HOSTED_API = "http://localhost:8081"
+SELF_HOSTED_API = "http://tgapi.arshman.space:8088"
 BROADCAST_CHATS = [ -1002780909369, ]  # Add chat IDs here, e.g., [123456789, 987654321]
 
 session = AiohttpSession(api=TelegramAPIServer.from_base(SELF_HOSTED_API))
