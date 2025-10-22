@@ -189,10 +189,11 @@ async def process_url(source_url: str, chat_id: int, is_channel: bool = False):
     for link in response["links"]:
         asyncio.create_task(process_file(link, source_url, is_channel))
 
-# Handle /start command (for PMs)
-@router.message(CommandStart())
+@router.message(Command("start"))
 async def start(message: Message):
-    await message.answer("👋 Send me any TeraBox link — I'll download it automatically.")
+    logger.info(f"Start command received from chat ID: {message.chat.id}")
+    await message.answer("Send me TeraBox links to download videos.")
+
 
 # Handle messages in private chats, groups, and supergroups (NOT channels)
 @router.message()
