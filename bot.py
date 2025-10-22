@@ -35,7 +35,6 @@ BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_ENDPOINT = "https://terabox.itxarshman.workers.dev/api"
 SELF_HOSTED_API = "http://tgapi.arshman.space:8088"
 BROADCAST_CHATS = []# -1002780909369, ]  # Add chat IDs here, e.g., [123456789, 987654321]
-SOURCE_CHANNELS = []  # Add channel IDs to monitor, e.g., [-1001234567890]
 
 session = AiohttpSession(api=TelegramAPIServer.from_base(SELF_HOSTED_API))
 bot = Bot(token=BOT_TOKEN, session=session)
