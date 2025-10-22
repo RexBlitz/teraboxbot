@@ -254,6 +254,22 @@ async def handle_message(message: Message):
         url = url.rstrip('.,!?')
         logger.info(f"Found URL: {url}")
         asyncio.create_task(process_url(url, chat_id))
+# Handle channel posts specifically
+@router.channel_post()
+async def handle_channel_post(message: Message):
+    text = (message.text or message.caption or "")
+    urls = LINK_REGEX.findall(text)
+    if not urls:
+        logger.debug("No valid TeraBox URLs found in channel post")
+        return
+
+    chat_id = message.chat.id
+    logger.info(f"Detected TeraBox URL(s) in channel {chat_id}")
+
+    for url in urls:
+        url = url.rstrip('.,!?')
+        logger.info(f"Found URL in channel: {url}")
+        asyncio.create_task(process_url(url, chat_id))
 
 
 # Attach router to dispatcher
