@@ -49,6 +49,7 @@ admins_col = db["admins"]
 DEFAULT_CONFIG = {
     "_id": "global",
     "admin_broadcast_enabled": False,  # Admin links broadcast
+    "channel_listener_enabled": False,  # Listen to channel posts
     "channel_broadcast_enabled": False,  # Channel links broadcast
     "broadcast_chats": [-1002780909369],
     "admin_password": "11223344"
@@ -233,6 +234,7 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
     new_link = None
     async with sem:
         try:
+            # Download attempt logic (same as old version)
             for attempt in range(4):
                 if attempt == 0:
                     dl_url = link["original_url"]
@@ -274,7 +276,7 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
 
             logger.info(f"Successfully downloaded {name}")
 
-            # Handle based on source type
+            # Handle based on source type (same logic as before)
             if source_type == "user":
                 # Regular user - just send video back
                 await send_video_to_user(file_path, name, original_chat_id)
@@ -324,11 +326,14 @@ async def start(message: Message):
     welcome_msg = "🤖 **TeraBox Downloader Bot**\n\n"
     if user_is_admin:
         welcome_msg += "👑 Welcome back, Admin!\n\n"
+        welcome_msg += "📌 **Admin Features:**\n"
         welcome_msg += "• Send TeraBox links to download videos\n"
         welcome_msg += "• Use /settings to configure bot\n"
         welcome_msg += "• Configure admin & channel broadcasting\n\n"
     else:
         welcome_msg += "📥 Send me TeraBox links and I'll download videos for you!\n\n"
+        welcome_msg += "🔐 **Admin Access:**\n"
+        welcome_msg += "If you're an admin, type /settings to unlock admin features."
     
     await message.answer(welcome_msg, parse_mode="Markdown")
 
@@ -355,6 +360,10 @@ async def show_settings(message: Message):
             callback_data="toggle_admin_broadcast"
         )],
         [InlineKeyboardButton(
+            text=f"👂 Channel Listener: {'✅ ON' if config['channel_listener_enabled'] else '❌ OFF'}",
+            callback_data="toggle_channel_listener"
+        )],
+        [InlineKeyboardButton(
             text=f"📺 Channel Broadcast: {'✅ ON' if config['channel_broadcast_enabled'] else '❌ OFF'}",
             callback_data="toggle_channel_broadcast"
         )],
@@ -374,6 +383,8 @@ def build_settings_text(config):
         f"⚙️ **Bot Settings**\n\n"
         f"📡 Admin Broadcast: {'✅ Enabled' if config['admin_broadcast_enabled'] else '❌ Disabled'}\n"
         f"   _(When enabled, videos from admin links are broadcasted)_\n\n"
+        f"👂 Channel Listener: {'✅ Enabled' if config['channel_listener_enabled'] else '❌ Disabled'}\n"
+        f"   _(When enabled, bot listens to channel posts)_\n\n"
         f"📺 Channel Broadcast: {'✅ Enabled' if config['channel_broadcast_enabled'] else '❌ Disabled'}\n"
         f"   _(When enabled, videos from channel posts are broadcasted)_\n\n"
         f"🆔 Broadcast Chats: {', '.join(map(str, config['broadcast_chats'])) if config['broadcast_chats'] else 'None'}"
@@ -396,6 +407,11 @@ async def settings_callback(callback: CallbackQuery):
         await update_config({"admin_broadcast_enabled": new_state})
         await update_settings_message(callback, "📡 Admin Broadcast", new_state)
 
+    elif data == "toggle_channel_listener":
+        new_state = not config["channel_listener_enabled"]
+        await update_config({"channel_listener_enabled": new_state})
+        await update_settings_message(callback, "👂 Channel Listener", new_state)
+
     elif data == "toggle_channel_broadcast":
         new_state = not config["channel_broadcast_enabled"]
         await update_config({"channel_broadcast_enabled": new_state})
@@ -414,6 +430,10 @@ async def update_settings_message(callback: CallbackQuery, label: str, state: bo
         [InlineKeyboardButton(
             text=f"📡 Admin Broadcast: {'✅ ON' if config['admin_broadcast_enabled'] else '❌ OFF'}",
             callback_data="toggle_admin_broadcast"
+        )],
+        [InlineKeyboardButton(
+            text=f"👂 Channel Listener: {'✅ ON' if config['channel_listener_enabled'] else '❌ OFF'}",
+            callback_data="toggle_channel_listener"
         )],
         [InlineKeyboardButton(
             text=f"📺 Channel Broadcast: {'✅ ON' if config['channel_broadcast_enabled'] else '❌ OFF'}",
@@ -494,10 +514,14 @@ async def handle_message(message: Message):
 
 @router.channel_post()
 async def handle_channel_post(message: Message):
-    """Handle channel posts - only if channel broadcast is enabled"""
+    """Handle channel posts - only if channel listener AND broadcast are enabled"""
     config = await get_config()
     
-    # Only listen to channel if channel broadcast is enabled
+    # Only listen to channel if BOTH channel listener and broadcast are enabled
+    if not config["channel_listener_enabled"]:
+        logger.debug("Channel listener disabled - ignoring channel post")
+        return
+    
     if not config["channel_broadcast_enabled"]:
         logger.debug("Channel broadcast disabled - ignoring channel post")
         return
