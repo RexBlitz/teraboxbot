@@ -11,6 +11,8 @@ from aiogram.filters import Command
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramBadRequest
+from motor.motor_asyncio import AsyncIOMotorClient
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 
 # Configure logging
@@ -35,18 +37,41 @@ BOT_TOKEN = "8008678561:AAH80tlSuc-tqEYb12eXMfUGfeo7Wz8qUEU"
 API_ENDPOINT = "https://terabox.itxarshman.workers.dev/api"
 SELF_HOSTED_API = "http://tgapi.arshman.space:8088"
 
-# Feature flags
-ENABLE_BROADCAST = False  # Set to False to disable broadcasting videos
-ENABLE_CHANNEL_LISTENER = False  # Set to False to disable processing links from channels
+# MongoDB setup
+MONGO_URI = "mongodb://localhost:27017"
+mongo = AsyncIOMotorClient(MONGO_URI)
+db = mongo["teradownloader"]
+config_col = db["config"]
+broadcast_col = db["broadcasted"]
 
-# Broadcast configuration
-BROADCAST_CHATS = [ -1002780909369, ]  # Add chat IDs here, e.g., [123456789, 987654321]
+# Default global config
+DEFAULT_CONFIG = {
+    "_id": "global",
+    "broadcast_enabled": False,
+    "channel_listener_enabled": False,
+    "broadcast_chats": [-1002780909369,],
+    "admin_password": "11223344"
+}
+
+
 
 session = AiohttpSession(api=TelegramAPIServer.from_base(SELF_HOSTED_API))
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 router = Router(name="terabox_listener")
 sem = asyncio.Semaphore(50)  # 50 concurrent connections
+
+async def get_config():
+    config = await config_col.find_one({"_id": "global"})
+    if not config:
+        await config_col.insert_one(DEFAULT_CONFIG)
+        return DEFAULT_CONFIG
+    return config
+
+async def update_config(update: dict):
+    await config_col.update_one({"_id": "global"}, {"$set": update})
+
+
 
 async def get_links(source_url: str):
     logger.info(f"Requesting links for URL: {source_url}")
@@ -95,30 +120,35 @@ async def download_file(dl_url: str, filename: str, size_mb: float, attempt: int
     return True, path
 
 async def broadcast_video(file_path: str, video_name: str):
-    if not ENABLE_BROADCAST:
+    config = await get_config()
+    if not config["broadcast_enabled"]:
         logger.info(f"Broadcast disabled - skipping {video_name}")
         return
-    if not BROADCAST_CHATS:
+
+    # Prevent duplicates
+    if await broadcast_col.find_one({"name": video_name}):
+        logger.info(f"Duplicate broadcast skipped: {video_name}")
+        return
+
+    chats = config.get("broadcast_chats", [])
+    if not chats:
         logger.warning("No broadcast chats configured")
         return
-    if not video_name.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm')):
-        logger.info(f"Skipping broadcast for non-video file: {video_name}")
-        return
+
     broadcast_count = 0
-    for bc_chat_id in BROADCAST_CHATS:
+    for bc_chat_id in chats:
         try:
             input_file = FSInputFile(file_path, filename=video_name)
-            await bot.send_video(
-                chat_id=bc_chat_id,
-                video=input_file,
-                supports_streaming=True
-            )
-            logger.info(f"📤 Broadcasted {video_name} to chat {bc_chat_id}")
+            await bot.send_video(chat_id=bc_chat_id, video=input_file, supports_streaming=True)
+            await broadcast_col.insert_one({"name": video_name, "chat_id": bc_chat_id, "timestamp": time.time()})
             broadcast_count += 1
+            logger.info(f"📤 Broadcasted {video_name} to chat {bc_chat_id}")
         except Exception as e:
             logger.error(f"❌ Broadcast failed for chat {bc_chat_id}: {str(e)[:100]}")
+
     if broadcast_count > 0:
-        logger.info(f"✅ Broadcast complete: {broadcast_count}/{len(BROADCAST_CHATS)} chats")
+        logger.info(f"✅ Broadcast complete: {broadcast_count}/{len(chats)} chats")
+
 
 async def process_file(link: dict, source_url: str, is_channel: bool = False):
     name = link.get("name", "unknown")
@@ -250,16 +280,163 @@ async def handle_channel_post(message: Message):
         asyncio.create_task(process_url(url, chat_id, is_channel=True))
 
 
+@router.message(Command("settings"))
+async def settings_command(message: Message):
+    config = await get_config()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"📡 Broadcast: {'✅ ON' if config['broadcast_enabled'] else '❌ OFF'}",
+            callback_data="toggle_broadcast"
+        )],
+        [InlineKeyboardButton(
+            text=f"📺 Channel Listener: {'✅ ON' if config['channel_listener_enabled'] else '❌ OFF'}",
+            callback_data="toggle_channel"
+        )],
+        [InlineKeyboardButton(
+            text="🆔 Set Broadcast Chat ID(s)",
+            callback_data="set_broadcast_id"
+        )],
+    ])
+    await message.answer(
+        build_settings_text(config),
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+def build_settings_text(config):
+    return (
+        f"⚙️ **Bot Settings**\n\n"
+        f"📡 Broadcast: {'✅ Enabled' if config['broadcast_enabled'] else '❌ Disabled'}\n"
+        f"📺 Channel Listener: {'✅ Enabled' if config['channel_listener_enabled'] else '❌ Disabled'}\n"
+        f"🆔 Broadcast Chats: {', '.join(map(str, config['broadcast_chats'])) if config['broadcast_chats'] else 'None'}"
+    )
+
+
+pending_auth = {}
+
+@router.callback_query()
+async def settings_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    data = callback.data
+
+    config = await get_config()
+
+    # Step 1: Check password
+    if user_id not in pending_auth and data != "verify_pass":
+        pending_auth[user_id] = data
+        await callback.message.answer("🔐 Enter admin password:")
+        await callback.answer()
+        return
+
+    # Step 2: Toggle or update based on action
+    if data == "toggle_broadcast":
+        new_state = not config["broadcast_enabled"]
+        await update_config({"broadcast_enabled": new_state})
+        await update_settings_message(callback, "📡 Broadcast", new_state)
+
+    elif data == "toggle_channel":
+        new_state = not config["channel_listener_enabled"]
+        await update_config({"channel_listener_enabled": new_state})
+        await update_settings_message(callback, "📺 Channel Listener", new_state)
+
+    elif data == "set_broadcast_id":
+        await callback.message.answer("📨 Send new broadcast chat ID(s), comma-separated:")
+        pending_auth[user_id] = "await_broadcast_ids"
+        await callback.answer()
+async def update_settings_message(callback: CallbackQuery, label: str, state: bool):
+    """Edits the current message with updated config"""
+    config = await get_config()
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"📡 Broadcast: {'✅ ON' if config['broadcast_enabled'] else '❌ OFF'}",
+            callback_data="toggle_broadcast"
+        )],
+        [InlineKeyboardButton(
+            text=f"📺 Channel Listener: {'✅ ON' if config['channel_listener_enabled'] else '❌ OFF'}",
+            callback_data="toggle_channel"
+        )],
+        [InlineKeyboardButton(
+            text="🆔 Set Broadcast Chat ID(s)",
+            callback_data="set_broadcast_id"
+        )],
+    ])
+
+    await callback.message.edit_text(
+        build_settings_text(config),
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer(f"{label} turned {'ON' if state else 'OFF'} ✅")
+
+@router.message()
+async def handle_auth_or_id(message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    if user_id not in pending_auth:
+        return
+
+    state = pending_auth[user_id]
+    config = await get_config()
+
+    # Password entry
+    if state not in ("await_broadcast_ids",):
+        if text == config["admin_password"]:
+            await message.answer("✅ Password accepted! You can now change settings.")
+        else:
+            await message.answer("❌ Wrong password.")
+        del pending_auth[user_id]
+        return
+
+    # Broadcast ID entry
+    if state == "await_broadcast_ids":
+        try:
+            ids = [int(x.strip()) for x in text.split(",") if x.strip()]
+            await update_config({"broadcast_chats": ids})
+            await message.answer(f"✅ Updated broadcast chats: {ids}")
+
+            # Auto-refresh settings message
+            async for msg in message.chat.get_history(limit=5):
+                if msg.text and msg.text.startswith("⚙️ **Bot Settings**"):
+                    config = await get_config()
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text=f"📡 Broadcast: {'✅ ON' if config['broadcast_enabled'] else '❌ OFF'}",
+                            callback_data="toggle_broadcast"
+                        )],
+                        [InlineKeyboardButton(
+                            text=f"📺 Channel Listener: {'✅ ON' if config['channel_listener_enabled'] else '❌ OFF'}",
+                            callback_data="toggle_channel"
+                        )],
+                        [InlineKeyboardButton(
+                            text="🆔 Set Broadcast Chat ID(s)",
+                            callback_data="set_broadcast_id"
+                        )],
+                    ])
+                    await msg.edit_text(
+                        build_settings_text(config),
+                        reply_markup=keyboard,
+                        parse_mode="Markdown"
+                    )
+                    break
+        except ValueError:
+            await message.answer("❌ Invalid format. Please enter numeric chat IDs separated by commas.")
+        del pending_auth[user_id]
+
+
+
+
+
 # Attach router to dispatcher
 dp.include_router(router)
 
 # Start polling
 if __name__ == "__main__":
-    logger.info("🚀 Starting TeraDownloader bot")
-    logger.info(f"📡 Channel Listener: {'ENABLED' if ENABLE_CHANNEL_LISTENER else 'DISABLED'}")
-    logger.info(f"📤 Broadcast: {'ENABLED' if ENABLE_BROADCAST else 'DISABLED'}")
-    if ENABLE_BROADCAST:
-        logger.info(f"📋 Broadcast Chats: {BROADCAST_CHATS}")
-    if ENABLE_CHANNEL_LISTENER and (not ENABLE_BROADCAST or not BROADCAST_CHATS):
-        logger.warning("⚠️  Channel listener enabled but broadcast is disabled or not configured - channel posts will be ignored")
-    asyncio.run(dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()))
+    async def main():
+        await get_config()  # Ensure defaults exist
+        await set_bot_commands()
+        logger.info("🚀 Starting TeraDownloader bot")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+    asyncio.run(main())
