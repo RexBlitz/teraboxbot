@@ -15,4 +15,4 @@ COPY . .
 
 
 # ===== Run Bot =====
-CMD ["python", "bot.py"]
+CMD ["python", "bot1.py"]
