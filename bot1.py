@@ -13,6 +13,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramBadRequest
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+import aiofiles
 
 # Configure logging
 logging.basicConfig(
