@@ -38,7 +38,7 @@ LINK_REGEX = re.compile(
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
-BOT_TOKEN = "bot token here"
+BOT_TOKEN = "8366499465:AAE72m_WzZ-sb9aJJ4YGv4KKMIXLjSafijA"
 # <<< NEW >>>  Updated API endpoint (Robin Shakya's worker)
 API_ENDPOINT = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
 
@@ -46,7 +46,7 @@ API_ENDPOINT = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
 SELF_HOSTED_API = "http://tgapi.arshman.space:8088"
 
 # MongoDB
-MONGO_URI = "url here"
+MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["teradownloader"]
 config_col = db["config"]
