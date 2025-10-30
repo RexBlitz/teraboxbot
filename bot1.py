@@ -8,7 +8,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 
 # ===== CONFIG =====
 BOT_TOKEN = "8366499465:AAE72m_WzZ-sb9aJJ4YGv4KKMIXLjSafijA"
-API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
+API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev"
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 CONCURRENT_DOWNLOADS = 15
 # ==================
