@@ -12,8 +12,8 @@ log_dir = "logs"
 os.makedirs(log_dir, exist_ok=True)
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.WARNING,
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(f"{log_dir}/bot.log"),
         logging.StreamHandler()
@@ -23,13 +23,19 @@ logger = logging.getLogger(__name__)
 
 # ===== CONFIG =====
 BOT_TOKEN = "8366499465:AAE72m_WzZ-sb9aJJ4YGv4KKMIXLjSafijA"
-API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev"
+TELEGRAM_API_URL = "http://tgapi.arshman.space:8088"
+TERABOX_API = "https://terabox-worker.robinkumarshakya103.workers.dev"
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 CONCURRENT_DOWNLOADS = 15
 DOWNLOAD_TIMEOUT = 300  # 5 minutes
 CHUNK_SIZE = 8192
 
-# ================== 
+# TeraBox-specific URL regex
+LINK_REGEX = re.compile(
+    r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink|teraboxurl)\.[^\s]+",
+    re.IGNORECASE
+)
+
 semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
 
 # ===== Commands =====
@@ -51,19 +57,14 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
         retry_count = 0
         
         try:
-            # Validate link format
-            if not re.match(r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+", link):
-                logger.warning(f"Invalid link format: {link}")
-                failed_links.append(link)
-                return
+            logger.warning(f"Processing: {link}")
 
-            logger.info(f"Processing link: {link}")
-
-            # Get file info from API
-            api_url = f"{API_BASE}/api?url={link}"
+            # Get file info from Terabox API
+            api_url = f"{TERABOX_API}/api?url={link}"
+            
             async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status != 200:
-                    logger.error(f"API error {resp.status} for link: {link}")
+                    logger.warning(f"API error {resp.status}")
                     failed_links.append(link)
                     return
 
@@ -71,25 +72,25 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
 
             # Validate response
             if not data.get("success") or not data.get("files") or len(data["files"]) == 0:
-                logger.error(f"Invalid API response for link: {link}")
+                logger.warning(f"Invalid API response")
                 failed_links.append(link)
                 return
 
             file = data["files"][0]
             filename = file.get("file_name", "unknown")
             size_bytes = int(file.get("size_bytes", 0))
+            file_size = file.get("size", "unknown")
             
-            # Try different download URLs in order of preference
+            # Prefer streaming_url to avoid sign errors
             download_url = file.get("streaming_url") or file.get("download_url") or file.get("original_download_url")
             
             if not download_url:
-                logger.error(f"No download URL available for: {filename}")
+                logger.warning(f"No download URL")
                 failed_links.append(link)
                 return
 
             # Check file size
             if size_bytes > MAX_FILE_SIZE:
-                logger.warning(f"File too large ({size_bytes} bytes): {filename}")
                 await update.message.reply_text(
                     f"❌ File too large: *{filename}*\n"
                     f"Size: {file.get('size', 'unknown')} (Max: 2GB)",
@@ -101,8 +102,6 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
             # Create temp directory if needed
             os.makedirs("/tmp", exist_ok=True)
             file_path = f"/tmp/{filename}"
-
-            logger.info(f"Downloading: {filename} ({file.get('size', 'unknown')})")
 
             # Headers for download
             headers = {
@@ -118,21 +117,16 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
                     # Get fresh download URL before each attempt
                     async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                         if resp.status != 200:
-                            logger.error(f"API error {resp.status} for link: {link}")
                             break
 
                         fresh_data = await resp.json()
 
-                    if not fresh_data.get("files"):
-                        logger.error(f"No files in fresh API response")
+                    if not fresh_data.get("success") or not fresh_data.get("files"):
                         break
 
                     download_url = fresh_data["files"][0].get("streaming_url") or fresh_data["files"][0].get("download_url") or fresh_data["files"][0].get("original_download_url")
                     if not download_url:
-                        logger.error(f"No download URL in fresh response")
                         break
-
-                    logger.info(f"Download attempt {retry_count + 1}/{max_retries}: {filename}")
 
                     # Download file with timeout
                     async with session.get(download_url, headers=headers, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as r:
@@ -141,61 +135,52 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
                                 async for chunk in r.content.iter_chunked(CHUNK_SIZE):
                                     await f.write(chunk)
                             
-                            logger.info(f"Downloaded successfully: {filename}")
+                            logger.warning(f"✅ Downloaded: {filename}")
                             break
                         else:
-                            error_text = await r.text()
-                            logger.warning(f"Download attempt {retry_count + 1} failed - Status: {r.status}")
-                            logger.warning(f"Response: {error_text[:200]}")
                             retry_count += 1
-                            
                             if retry_count < max_retries:
-                                await asyncio.sleep(2)  # Wait before retry
+                                await asyncio.sleep(2)
                             else:
-                                logger.error(f"All {max_retries} attempts failed")
+                                logger.warning(f"❌ Failed after {max_retries} attempts")
                                 failed_links.append(link)
                                 return
 
                 except Exception as e:
                     retry_count += 1
-                    logger.warning(f"Download attempt {retry_count} error: {str(e)}")
-                    if retry_count < max_retries:
-                        await asyncio.sleep(2)
-                    else:
+                    if retry_count >= max_retries:
                         raise
 
             # Send video
             if os.path.exists(file_path):
-                caption = f"🎬 *{filename}*\n📦 Size: {file.get('size', 'unknown')}"
+                caption = f"🎬 *{filename}*\n📦 Size: {file_size}"
                 with open(file_path, "rb") as video_file:
                     await update.message.reply_video(
                         video=video_file,
                         caption=caption,
                         parse_mode="Markdown"
                     )
-                logger.info(f"Sent to user: {filename}")
+                logger.warning(f"📤 Sent: {filename}")
             else:
-                logger.error(f"File not found after download: {file_path}")
                 failed_links.append(link)
 
         except asyncio.TimeoutError:
-            logger.error(f"Timeout downloading: {link}")
+            logger.warning(f"⏱️ Timeout")
             failed_links.append(link)
-            await update.message.reply_text(f"⏱️ Download timeout for: {link}")
+            await update.message.reply_text(f"⏱️ Download timeout")
         except aiohttp.ClientError as e:
-            logger.error(f"Network error for {link}: {str(e)}")
+            logger.warning(f"🌐 Network error: {str(e)}")
             failed_links.append(link)
         except Exception as e:
-            logger.error(f"Unexpected error for {link}: {str(e)}")
+            logger.warning(f"❌ Error: {str(e)}")
             failed_links.append(link)
         finally:
             # Clean up temp file
             if file_path and os.path.exists(file_path):
                 try:
                     os.remove(file_path)
-                    logger.info(f"Cleaned up temp file: {file_path}")
-                except Exception as e:
-                    logger.error(f"Failed to cleanup {file_path}: {str(e)}")
+                except Exception:
+                    pass
 
 # ===== Message Handler =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,19 +189,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             return
 
-        # Clean and extract links
-        clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
-        clean_text = re.sub(r"\s+", " ", clean_text)
-        
-        links = list(dict.fromkeys(
-            re.findall(r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+", clean_text)
-        ))
+        # Extract links using comprehensive regex
+        links = list(dict.fromkeys(LINK_REGEX.findall(text)))
 
         if not links:
-            await update.message.reply_text("❌ No Terabox links found in your message.")
             return
 
-        logger.info(f"Found {len(links)} link(s)")
+        logger.warning(f"🔍 Found {len(links)} link(s)")
         msg = await update.message.reply_text(f"🔍 Found {len(links)} link(s). Starting downloads...")
 
         failed_links = []
@@ -230,22 +209,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Report failures
         if failed_links:
             await update.message.reply_text(
-                "❌ Failed to download the following link(s):\n" + "\n".join(failed_links),
-                parse_mode="Markdown"
+                "❌ Failed links:\n" + "\n".join(failed_links)
             )
 
         await msg.delete()
 
     except Exception as e:
-        logger.error(f"Error in handle_message: {str(e)}")
-        await update.message.reply_text("❌ An error occurred. Please try again.")
+        logger.warning(f"Handler error: {str(e)}")
+        await update.message.reply_text("❌ An error occurred. Try again.")
 
 # ===== Bot Launcher =====
 def run_bot():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).base_url(TELEGRAM_API_URL).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("🚀 Bot is running...")
+    logger.warning("🚀 Bot started")
     app.run_polling()
 
 if __name__ == "__main__":
