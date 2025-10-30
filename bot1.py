@@ -172,8 +172,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def run_bot():
     """Builds and runs the Telegram bot using the self-hosted API."""
     
-    # Crucial Fix: Use the self-hosted API URL
-    app = ApplicationBuilder().token(BOT_TOKEN).api_url(SELF_HOSTED_TG_API).build()
+    # FIX: Changed .api_url() to .base_url() to resolve AttributeError based on traceback.
+    app = ApplicationBuilder().token(BOT_TOKEN).base_url(SELF_HOSTED_TG_API).build()
 
     # Add handlers
     app.add_handler(CommandHandler("start", start))
