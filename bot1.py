@@ -11,9 +11,10 @@ import traceback
 # ===== CONFIG =====
 BOT_TOKEN = "8366499465:AAE72m_WzZ-sb9aJJ4YGv4KKMIXLjSafijA"
 TERABOX_API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev"
-# FIX: Removing the trailing slash. The library usually appends /bot<token>/ to the base URL.
-SELF_HOSTED_TG_API = "http://tgapi.arshman.space:8088"  # Your self-hosted Telegram Bot API
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 2014  # 2GB (Telegram limit)
+# FIX: Re-adding the trailing slash to prevent URL concatenation error (InvalidURL).
+SELF_HOSTED_TG_API = "http://tgapi.arshman.space:8088/"  # Your self-hosted Telegram Bot API
+# FIX: Corrected MAX_FILE_SIZE calculation from * 2014 to * 1024 (2GB)
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB (Telegram limit)
 CONCURRENT_DOWNLOADS = 15
 # ==================
 
@@ -173,8 +174,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def run_bot():
     """Builds and runs the Telegram bot using the self-hosted API."""
     
-    # FIX: Changed .api_url() to .base_url() to resolve AttributeError based on traceback.
-    # We are using the base URL without the trailing slash for maximum compatibility.
+    # FIX: Changed .api_url() to .base_url() and ensured the trailing slash is present
     app = ApplicationBuilder().token(BOT_TOKEN).base_url(SELF_HOSTED_TG_API).build()
 
     # Add handlers
