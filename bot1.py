@@ -99,11 +99,23 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
             file_path = f"/tmp/{filename}"
 
             logger.info(f"Downloading: {filename} ({file.get('size', 'unknown')})")
+            logger.debug(f"Download URL: {download_url}")
+
+            # Headers for download
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://www.terabox.com/',
+                'Accept': '*/*',
+                'Accept-Encoding': 'gzip, deflate',
+            }
 
             # Download file with timeout
-            async with session.get(download_url, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as r:
+            async with session.get(download_url, headers=headers, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as r:
                 if r.status != 200:
-                    logger.error(f"Download failed with status {r.status}: {filename}")
+                    error_text = await r.text()
+                    logger.error(f"Download failed - Status: {r.status}, File: {filename}")
+                    logger.error(f"Response: {error_text[:200]}")
+                    logger.error(f"Headers: {dict(r.headers)}")
                     failed_links.append(link)
                     return
 
