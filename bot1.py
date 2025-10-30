@@ -47,6 +47,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def download_and_send(update: Update, link: str, failed_links: list, session: aiohttp.ClientSession):
     async with semaphore:
         file_path = None
+        max_retries = 3
+        retry_count = 0
+        
         try:
             # Validate link format
             if not re.match(r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare)\.com/s/[A-Za-z0-9_-]+", link):
@@ -75,13 +78,6 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
             file = data["files"][0]
             filename = file.get("file_name", "unknown")
             size_bytes = int(file.get("size_bytes", 0))
-            download_url = file.get("download_url")
-
-            # Validate download URL
-            if not download_url:
-                logger.error(f"No download URL for: {filename}")
-                failed_links.append(link)
-                return
 
             # Check file size
             if size_bytes > MAX_FILE_SIZE:
@@ -99,7 +95,6 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
             file_path = f"/tmp/{filename}"
 
             logger.info(f"Downloading: {filename} ({file.get('size', 'unknown')})")
-            logger.debug(f"Download URL: {download_url}")
 
             # Headers for download
             headers = {
@@ -109,32 +104,71 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
                 'Accept-Encoding': 'gzip, deflate',
             }
 
-            # Download file with timeout
-            async with session.get(download_url, headers=headers, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as r:
-                if r.status != 200:
-                    error_text = await r.text()
-                    logger.error(f"Download failed - Status: {r.status}, File: {filename}")
-                    logger.error(f"Response: {error_text[:200]}")
-                    logger.error(f"Headers: {dict(r.headers)}")
-                    failed_links.append(link)
-                    return
+            # Retry loop with fresh URL generation
+            while retry_count < max_retries:
+                try:
+                    # Get fresh download URL before each attempt
+                    async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                        if resp.status != 200:
+                            logger.error(f"API error {resp.status} for link: {link}")
+                            break
 
-                async with aiofiles.open(file_path, "wb") as f:
-                    async for chunk in r.content.iter_chunked(CHUNK_SIZE):
-                        await f.write(chunk)
+                        fresh_data = await resp.json()
 
-            logger.info(f"Downloaded successfully: {filename}")
+                    if not fresh_data.get("files"):
+                        logger.error(f"No files in fresh API response")
+                        break
+
+                    download_url = fresh_data["files"][0].get("download_url")
+                    if not download_url:
+                        logger.error(f"No download URL in fresh response")
+                        break
+
+                    logger.info(f"Download attempt {retry_count + 1}/{max_retries}: {filename}")
+
+                    # Download file with timeout
+                    async with session.get(download_url, headers=headers, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as r:
+                        if r.status == 200:
+                            async with aiofiles.open(file_path, "wb") as f:
+                                async for chunk in r.content.iter_chunked(CHUNK_SIZE):
+                                    await f.write(chunk)
+                            
+                            logger.info(f"Downloaded successfully: {filename}")
+                            break
+                        else:
+                            error_text = await r.text()
+                            logger.warning(f"Download attempt {retry_count + 1} failed - Status: {r.status}")
+                            logger.warning(f"Response: {error_text[:200]}")
+                            retry_count += 1
+                            
+                            if retry_count < max_retries:
+                                await asyncio.sleep(2)  # Wait before retry
+                            else:
+                                logger.error(f"All {max_retries} attempts failed")
+                                failed_links.append(link)
+                                return
+
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"Download attempt {retry_count} error: {str(e)}")
+                    if retry_count < max_retries:
+                        await asyncio.sleep(2)
+                    else:
+                        raise
 
             # Send video
-            caption = f"🎬 *{filename}*\n📦 Size: {file.get('size', 'unknown')}"
-            with open(file_path, "rb") as video_file:
-                await update.message.reply_video(
-                    video=video_file,
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
-
-            logger.info(f"Sent to user: {filename}")
+            if os.path.exists(file_path):
+                caption = f"🎬 *{filename}*\n📦 Size: {file.get('size', 'unknown')}"
+                with open(file_path, "rb") as video_file:
+                    await update.message.reply_video(
+                        video=video_file,
+                        caption=caption,
+                        parse_mode="Markdown"
+                    )
+                logger.info(f"Sent to user: {filename}")
+            else:
+                logger.error(f"File not found after download: {file_path}")
+                failed_links.append(link)
 
         except asyncio.TimeoutError:
             logger.error(f"Timeout downloading: {link}")
