@@ -30,13 +30,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== Download Function =====
 async def download_and_send(update: Update, link: str, failed_links: list, session: aiohttp.ClientSession):
     async with semaphore:
+        file_path = None # Initialize file_path for cleanup in finally block
         try:
             # Get file info
             # This request now uses the updated API_BASE: http://tgapi.arshman.space:8088/api?url=...
             async with session.get(f"{API_BASE}?url={link}", timeout=60) as resp:
                 data = await resp.json()
                 if not data.get("success") or not data.get("files"):
-                    print(f"API failed for {link}: {data.get('message')}")
+                    # Log specific API failure reason
+                    failure_message = data.get('message', 'Unknown API error or file list empty')
+                    print(f"API Failure ({link}): {failure_message}")
                     failed_links.append(link)
                     return
 
@@ -48,29 +51,45 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
                 caption = f"🎬 *{filename}*\n📦 Size: {file['size']}\n"
 
                 if size_bytes > MAX_FILE_SIZE:
-                    print(f"File too large: {filename} ({file['size']})")
+                    # Log file size failure
+                    max_gb = MAX_FILE_SIZE / (1024 * 1024 * 1024)
+                    print(f"File Too Large ({link}): {filename} ({file['size']}). Max allowed: {max_gb:.1f} GB.")
                     failed_links.append(link)
                     return
 
-                # Download file asynchronously
-                file_path = f"/tmp/{filename}"
-                async with session.get(download_url) as r:
-                    r.raise_for_status()
-                    async with aiofiles.open(file_path, "wb") as f:
-                        async for chunk in r.content.iter_chunked(8192):
-                            await f.write(chunk)
+            # Download file asynchronously
+            file_path = f"/tmp/{filename}"
+            async with session.get(download_url) as r:
+                r.raise_for_status() # Catches 4xx/5xx HTTP errors during download
+                async with aiofiles.open(file_path, "wb") as f:
+                    async for chunk in r.content.iter_chunked(8192):
+                        await f.write(chunk)
 
-                # Send video
-                await update.message.reply_video(
-                    video=open(file_path, "rb"),
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
-                os.remove(file_path)
+            # Send video
+            await update.message.reply_video(
+                video=open(file_path, "rb"),
+                caption=caption,
+                parse_mode="Markdown"
+            )
+
+        except aiohttp.ClientResponseError as e:
+            # Log specific HTTP errors (like 404, 500 from download URL)
+            print(f"HTTP Download Error ({link}): Status {e.status} for URL {e.request_info.url}")
+            failed_links.append(link)
 
         except Exception as e:
-            print(f"An error occurred during download of {link}: {e}")
+            # Catch-all for other errors (Connection, Telegram, file IO, JSON parsing)
+            print(f"General Error processing {link}: {type(e).__name__}: {e}")
             failed_links.append(link)
+
+        finally:
+            # Ensure file is removed whether success or failure occurred
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError as cleanup_e:
+                    print(f"Cleanup Warning: Could not remove temp file {file_path}: {cleanup_e}")
+
 
 # ===== Message Handler =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
