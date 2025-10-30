@@ -1,191 +1,314 @@
-import asyncio
-import re
 import os
-import aiohttp
-import aiofiles
+import re
+import logging
+import requests
+import asyncio
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.constants import ParseMode
-import traceback
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from urllib.parse import urlparse
 
-# ===== CONFIG =====
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
 BOT_TOKEN = "8366499465:AAE72m_WzZ-sb9aJJ4YGv4KKMIXLjSafijA"
 TERABOX_API_BASE = "https://terabox-worker.robinkumarshakya103.workers.dev"
-# FIX: Added a trailing slash (/) to ensure proper URL construction by the library.
-SELF_HOSTED_TG_API = "http://tgapi.arshman.space:8088/"  # Your self-hosted Telegram Bot API
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB (Telegram limit)
-CONCURRENT_DOWNLOADS = 15
-# ==================
+SELF_HOSTED_TG_API = "http://tgapi.arshman.space:8088"
 
-semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
+# TeraBox-specific URL regex
+LINK_REGEX = re.compile(
+    r"https?://[^\s]*?(?:terabox|teraboxapp|teraboxshare|nephobox|1024tera|teraboxurl|1024terabox|freeterabox|terasharefile|terasharelink|mirrobox|momerybox|teraboxlink|teraboxurl)\.[^\s]+",
+    re.IGNORECASE
+)
 
-# ===== Commands =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends a welcome message and lists available commands."""
-    msg = (
-        "👋 *Terabox Downloader Bot*\n\n"
-        "📥 Send me Terabox link(s) and I'll download them.\n"
-        "⚠️ Max file size: 2GB (due to Telegram limitations)\n\n"
-        "Available commands:\n"
-        "/start - Show this message"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+class TeraboxDownloaderBot:
+    def __init__(self):
+        self.bot_token = BOT_TOKEN
+        self.terabox_api = TERABOX_API_BASE
+        self.tg_api_url = SELF_HOSTED_TG_API
+        self.link_regex = LINK_REGEX
+        
+    def is_valid_terabox_url(self, url: str) -> bool:
+        """Check if the URL is a valid Terabox share URL using regex"""
+        return bool(self.link_regex.match(url.strip()))
 
-# ===== Download Function =====
-async def download_and_send(update: Update, link: str, failed_links: list, session: aiohttp.ClientSession):
-    """Fetches Terabox file info, downloads the file, and sends it to Telegram."""
-    
-    # Use the semaphore to limit concurrent downloads
-    async with semaphore:
+    async def get_download_info(self, share_url: str) -> dict:
+        """Get download information from Terabox API"""
         try:
-            # 1. Get file info from the worker API
-            # Note: Using /api endpoint as per the documentation
-            api_url = f"{TERABOX_API_BASE}/api?url={link}"
+            api_url = f"{self.terabox_api}/api"
+            params = {"url": share_url}
             
-            async with session.get(api_url, timeout=60) as resp:
-                if resp.status != 200:
-                    raise Exception(f"API failed with status {resp.status}")
+            async with asyncio.get_event_loop().run_in_executor(
+                None, lambda: requests.get(api_url, params=params, timeout=30)
+            ) as response:
                 
-                data = await resp.json()
-                
-                if not data.get("success") or not data.get("files"):
-                    print(f"API response failed for {link}: {data.get('message', 'No files found')}")
-                    raise Exception("API returned unsuccessful response or no files.")
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("success"):
+                        return data
+                    else:
+                        return {"error": "API returned unsuccessful response"}
+                else:
+                    return {"error": f"API request failed with status {response.status_code}"}
+                    
+        except requests.exceptions.Timeout:
+            return {"error": "Request timeout - please try again later"}
+        except requests.exceptions.RequestException as e:
+            return {"error": f"Network error: {str(e)}"}
+        except Exception as e:
+            return {"error": f"Unexpected error: {str(e)}"}
 
-            file = data["files"][0]
-            filename = file["file_name"]
-            # Ensure size is an integer for comparison, default to 0
-            size_bytes = int(file.get("size_bytes", 0))
-            download_url = file["download_url"]
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        welcome_text = """
+🤖 **Terabox Video Downloader Bot**
+
+Send me a Terabox share link and I'll download the video for you!
+
+**Supported Domains:**
+• terabox.com
+• teraboxapp.com
+• teraboxshare.com
+• nephobox.com
+• 1024tera.com
+• teraboxurl.com
+• 1024terabox.com
+• freeterabox.com
+• terasharefile.com
+• terasharelink.com
+• mirrobox.com
+• momerybox.com
+• teraboxlink.com
+• teraboxurl.com
+
+**How to use:**
+1. Copy a Terabox share link
+2. Paste it here
+3. I'll process and send you the video
+
+**Example link format:**
+`https://terabox.com/s/1bNLoEdlmOuyZcofBcnFdow`
+
+Made with ❤️ using Terabox API
+        """
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /help command"""
+        help_text = """
+🆘 **Help Guide**
+
+**How to download videos:**
+1. Find a Terabox video you want to download
+2. Copy the share link (usually looks like: `https://terabox.com/s/...`)
+3. Paste the link in this chat
+4. Wait for processing
+5. Download your video!
+
+**Supported Domains:**
+I support all major Terabox domains including:
+terabox.com, teraboxapp.com, 1024terabox.com, freeterabox.com, and 10+ more!
+
+**Common issues:**
+• Make sure the link is a valid Terabox share link
+• Some videos might be too large for Telegram
+• If download fails, try again later
+
+**Commands:**
+/start - Start the bot
+/help - Show this help message
+
+**Note:** This bot uses a third-party API to download videos from Terabox.
+        """
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming messages"""
+        user_message = update.message.text.strip()
+        
+        # Check if message contains a URL using regex
+        if not self.link_regex.search(user_message):
+            await update.message.reply_text(
+                "❌ Please send a valid Terabox share URL.\n\n"
+                "I support links from:\n"
+                "• terabox.com\n• 1024terabox.com\n• freeterabox.com\n"
+                "• teraboxapp.com\n• and 10+ other Terabox domains\n\n"
+                "**Example:** `https://terabox.com/s/1bNLoEdlmOuyZcofBcnFdow`",
+                parse_mode='Markdown'
+            )
+            return
+
+        # Extract the URL from message
+        url_match = self.link_regex.search(user_message)
+        if not url_match:
+            await update.message.reply_text("❌ Could not extract valid URL from your message.")
+            return
+
+        share_url = url_match.group(0)
+
+        # Send processing message
+        processing_msg = await update.message.reply_text(
+            "⏳ Processing your request... This may take a few moments."
+        )
+
+        try:
+            # Get download information from API
+            download_info = await self.get_download_info(share_url)
             
-            caption = f"🎬 *{filename}*\n📦 Size: {file['size']}\n"
-            
-            # 2. Check max file size
-            if size_bytes > MAX_FILE_SIZE:
-                await update.message.reply_text(
-                    f"❌ File '{filename}' is too large ({file['size']}). Max limit is 2GB.",
-                    reply_to_message_id=update.message.message_id
+            if "error" in download_info:
+                await processing_msg.edit_text(
+                    f"❌ Error: {download_info['error']}\n\nPlease try again later."
                 )
-                failed_links.append(link)
                 return
 
-            # 3. Download file asynchronously to a temporary location
-            file_path = f"/tmp/{os.path.basename(filename)}" # Use basename to avoid path traversal issues
+            files = download_info.get("files", [])
+            if not files:
+                await processing_msg.edit_text("❌ No downloadable files found in the provided link.")
+                return
 
-            download_msg = await update.message.reply_text(
-                f"📥 Starting download of *{filename}* ({file['size']})...",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=update.message.message_id
-            )
-
-            print(f"Downloading {filename} from {download_url}")
-            
-            download_headers = {"User-Agent": "Mozilla/5.0"} # Some workers require a UA
-            async with session.get(download_url, headers=download_headers, timeout=3600) as r: # Increase timeout for download
-                r.raise_for_status() # Raise exception for bad status codes
-                
-                async with aiofiles.open(file_path, "wb") as f:
-                    chunk_count = 0
-                    async for chunk in r.content.iter_chunked(8192):
-                        await f.write(chunk)
-                        chunk_count += 1
-                        # Optional: Update status message every N chunks for feedback
-                        if chunk_count % 500 == 0: 
-                             try:
-                                 # Prevent flooding by editing too often
-                                 await download_msg.edit_text(
-                                     f"⬇️ Downloading *{filename}*... (Progressing)", 
-                                     parse_mode=ParseMode.MARKDOWN
-                                 )
-                             except:
-                                 pass # Ignore edit errors (e.g., message not modified)
-            
-            print(f"Download complete for {filename}. Uploading...")
-
-            # 4. Send video/file to Telegram
-            with open(file_path, "rb") as f:
-                # Use reply_video or reply_document based on file type if needed, 
-                # but for simplicity, reply_video is often enough for common video formats.
-                await update.message.reply_video(
-                    video=f,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    supports_streaming=True,
-                    reply_to_message_id=update.message.message_id
-                )
-            
-            # 5. Clean up temporary message and file
-            await download_msg.delete()
-            os.remove(file_path)
+            # Process all files found
+            await self.process_files(update, processing_msg, files, download_info.get("credits", {}))
 
         except Exception as e:
-            print(f"Error processing link {link}: {e}")
-            traceback.print_exc()
-            failed_links.append(link)
-            # Try to clean up file if it exists
-            if 'file_path' in locals() and os.path.exists(file_path):
-                 os.remove(file_path)
+            logger.error(f"Error processing request: {str(e)}")
+            await processing_msg.edit_text(
+                "❌ An error occurred while processing your request. Please try again later."
+            )
 
-# ===== Message Handler =====
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes messages, extracts Terabox links, and starts downloads."""
-    
-    # Check for text in message or caption
-    text = update.message.text or getattr(update.message, "caption", None)
-    if not text:
-        return
+    async def process_files(self, update: Update, processing_msg, files: list, credits: dict):
+        """Process all files from the API response"""
+        try:
+            if len(files) == 1:
+                # Single file - process directly
+                file_info = files[0]
+                await self.send_file_info(update, processing_msg, file_info, credits)
+            else:
+                # Multiple files - show list
+                await self.send_files_list(update, processing_msg, files, credits)
+                
+        except Exception as e:
+            logger.error(f"Error processing files: {str(e)}")
+            await processing_msg.edit_text("❌ Error processing files.")
 
-    # Sanitize and extract unique Terabox links
-    clean_text = re.sub(r"[^\x20-\x7E]+", " ", text)
-    clean_text = re.sub(r"\s+", " ", clean_text)
-    # The regex is designed to find terabox, 1024terabox, and teraboxshare links
-    links = list(dict.fromkeys(
-        re.findall(r"https?://(?:www\.)?(?:terabox|1024terabox|teraboxshare|4funbox)\.com/s/[A-Za-z0-9_-]+", clean_text)
-    ))
+    async def send_file_info(self, update: Update, processing_msg, file_info: dict, credits: dict):
+        """Send information and download links for a single file"""
+        file_name = file_info.get("file_name", "Unknown")
+        file_size = file_info.get("size", "Unknown")
+        download_url = file_info.get("download_url")
+        streaming_url = file_info.get("streaming_url")
+        original_url = file_info.get("original_download_url")
 
-    if not links:
-        return
+        if not download_url:
+            await processing_msg.edit_text("❌ No download URL found for this file.")
+            return
 
-    # Inform user about found links
-    msg = await update.message.reply_text(
-        f"🔍 Found {len(links)} unique link(s). Starting downloads...",
-        reply_to_message_id=update.message.message_id
-    )
-    
-    failed_links = []
-    
-    # Use a single aiohttp session for all tasks for efficiency
-    async with aiohttp.ClientSession() as session:
-        tasks = [asyncio.create_task(download_and_send(update, link, failed_links, session)) for link in links]
-        await asyncio.gather(*tasks)
+        # Prepare download text with credits
+        credits_text = ""
+        if credits:
+            dev = credits.get("developer", "")
+            telegram = credits.get("telegram", "")
+            if dev and telegram:
+                credits_text = f"\n\n*Credits:* API by [{dev}]({telegram})"
 
-    # Report failures
-    if failed_links:
-        await update.message.reply_text(
-            "❌ Failed to download the following link(s):\n" + "\n".join(failed_links),
-            reply_to_message_id=update.message.message_id
+        download_text = f"""
+🎥 **Download Ready!**
+
+📁 **File:** `{file_name}`
+💾 **Size:** `{file_size}`
+
+🔗 **Download Links:**
+• [Direct Download]({download_url})
+• [Stream Online]({streaming_url or download_url})
+{f"• [Original URL]({original_url})" if original_url else ""}
+
+**Instructions:**
+1. Click the link above to download
+2. Or copy the URL and open in your browser
+
+⚠️ **Note:** For very large files, direct download is recommended.
+{credits_text}
+        """
+        
+        await processing_msg.edit_text(
+            download_text,
+            parse_mode='Markdown',
+            disable_web_page_preview=True
         )
-    
-    # Delete the initial status message
-    await msg.delete()
 
-# ===== Bot Launcher =====
-def run_bot():
-    """Builds and runs the Telegram bot using the self-hosted API."""
-    
-    # FIX: Changed .api_url() to .base_url() to resolve AttributeError based on traceback.
-    # The base_url now includes a trailing slash to prevent concatenation issues.
-    app = ApplicationBuilder().token(BOT_TOKEN).base_url(SELF_HOSTED_TG_API).build()
+    async def send_files_list(self, update: Update, processing_msg, files: list, credits: dict):
+        """Send list when multiple files are found"""
+        files_list = []
+        for i, file_info in enumerate(files[:10], 1):  # Limit to first 10 files
+            file_name = file_info.get("file_name", "Unknown")
+            file_size = file_info.get("size", "Unknown")
+            files_list.append(f"`{i}.` **{file_name}** - `{file_size}`")
 
-    # Add handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        files_text = "\n".join(files_list)
+        
+        credits_text = ""
+        if credits:
+            dev = credits.get("developer", "")
+            telegram = credits.get("telegram", "")
+            if dev and telegram:
+                credits_text = f"\n\n*Credits:* API by [{dev}]({telegram})"
 
-    print("🚀 Bot is running with self-hosted API...")
-    app.run_polling(poll_interval=1)
+        list_text = f"""
+📁 **Multiple Files Found** ({len(files)} files)
+
+{files_text}
+
+🔧 *Currently I can only process the first file. Support for multiple files coming soon!*
+
+{credits_text}
+        """
+        
+        await processing_msg.edit_text(
+            list_text,
+            parse_mode='Markdown'
+        )
+        
+        # Process first file
+        if files:
+            await self.send_file_info(update, processing_msg, files[0], credits)
+
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle errors"""
+        logger.error(f"Update {update} caused error: {context.error}")
+        
+        if update and update.message:
+            await update.message.reply_text(
+                "❌ An unexpected error occurred. Please try again later."
+            )
+
+    def run(self):
+        """Start the bot"""
+        # Create application with custom API server
+        application = Application.builder().token(self.bot_token).base_url(
+            self.tg_api_url
+        ).build()
+
+        # Add handlers
+        application.add_handler(CommandHandler("start", self.start_command))
+        application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND, self.handle_message
+        ))
+        
+        # Add error handler
+        application.add_error_handler(self.error_handler)
+
+        # Start the bot
+        logger.info("Bot is starting...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main():
+    """Main function"""
+    bot = TeraboxDownloaderBot()
+    bot.run()
 
 if __name__ == "__main__":
-    # Ensure /tmp directory exists for temporary file storage
-    if not os.path.exists('/tmp'):
-        os.makedirs('/tmp')
-    run_bot()
+    main()
