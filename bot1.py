@@ -78,6 +78,14 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
             file = data["files"][0]
             filename = file.get("file_name", "unknown")
             size_bytes = int(file.get("size_bytes", 0))
+            
+            # Try different download URLs in order of preference
+            download_url = file.get("streaming_url") or file.get("download_url") or file.get("original_download_url")
+            
+            if not download_url:
+                logger.error(f"No download URL available for: {filename}")
+                failed_links.append(link)
+                return
 
             # Check file size
             if size_bytes > MAX_FILE_SIZE:
@@ -119,7 +127,7 @@ async def download_and_send(update: Update, link: str, failed_links: list, sessi
                         logger.error(f"No files in fresh API response")
                         break
 
-                    download_url = fresh_data["files"][0].get("download_url")
+                    download_url = fresh_data["files"][0].get("streaming_url") or fresh_data["files"][0].get("download_url") or fresh_data["files"][0].get("original_download_url")
                     if not download_url:
                         logger.error(f"No download URL in fresh response")
                         break
