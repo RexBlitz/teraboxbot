@@ -6,6 +6,7 @@ import aiohttp
 import aiofiles
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 
 # ===== LOGGING =====
 log_dir = "logs"
@@ -220,7 +221,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== Bot Launcher =====
 def run_bot():
-    app = ApplicationBuilder().token(BOT_TOKEN).base_url(TELEGRAM_API_URL).build()
+    request = HTTPXRequest(base_url=TELEGRAM_API_URL)
+    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.warning("🚀 Bot started")
