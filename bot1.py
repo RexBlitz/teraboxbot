@@ -37,7 +37,7 @@ LINK_REGEX = re.compile(
 
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_BASE = "https://terabox.itxarshman.workers.dev"
+API_BASE = "https://teradll2.itxarshman.workers.dev"
 SELF_HOSTED_API = "http://tgapi.arshman.space:8088"
 
 # MongoDB setup
