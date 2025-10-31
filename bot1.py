@@ -181,10 +181,25 @@ async def download_file(dl_url: str, filename: str, size_mb: float, status_messa
     start_time = time.time()
     last_update_time = 0
     logger.info(f"Starting download of {filename} from {dl_url} (attempt {attempt + 1})")
+    
+    # Proper headers to bypass Referer restrictions
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Referer': 'https://www.terabox.com/',
+        'Origin': 'https://www.terabox.com',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site'
+    }
+    
     try:
         async with sem:
             async with aiohttp.ClientSession() as session:
-                async with session.get(dl_url) as resp:
+                async with session.get(dl_url, headers=headers) as resp:
                     if resp.status != 200:
                         logger.error(f"Download failed for {filename}, status: {resp.status}")
                         raise Exception(f"HTTP Status {resp.status}")
