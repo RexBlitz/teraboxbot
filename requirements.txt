@@ -4,3 +4,4 @@ aiofiles
 motor
 aiogram
 requests
+python-dotenv
