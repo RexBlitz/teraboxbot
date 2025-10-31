@@ -182,12 +182,12 @@ async def download_file(dl_url: str, filename: str, size_mb: float, status_messa
     last_update_time = 0
     logger.info(f"Starting download of {filename} from {dl_url} (attempt {attempt + 1})")
     
-    # Proper headers to bypass Referer restrictions
+    # Proper headers to bypass Referer restrictions and handle compression
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Encoding': 'gzip, deflate, br',  # Brotli support
         'Connection': 'keep-alive',
         'Referer': 'https://www.terabox.com/',
         'Origin': 'https://www.terabox.com',
@@ -198,17 +198,22 @@ async def download_file(dl_url: str, filename: str, size_mb: float, status_messa
     
     try:
         async with sem:
-            async with aiohttp.ClientSession() as session:
+            # Create session with auto_decompress enabled for Brotli
+            timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(dl_url, headers=headers) as resp:
                     if resp.status != 200:
                         logger.error(f"Download failed for {filename}, status: {resp.status}")
                         raise Exception(f"HTTP Status {resp.status}")
+                    
                     content_length = int(resp.headers.get('Content-Length', 0))
                     total_mb = content_length / (1024 * 1024) if content_length else size_mb
+                    
                     async for chunk in resp.content.iter_chunked(5 * 1024 * 1024):
                         with open(path, 'ab') as f:
                             f.write(chunk)
                         downloaded += len(chunk)
+                        
                         if time.time() - last_update_time > 5 and status_message:
                             elapsed = time.time() - start_time
                             speed_bps = (downloaded / elapsed) if elapsed > 0 else 0
@@ -231,6 +236,7 @@ async def download_file(dl_url: str, filename: str, size_mb: float, status_messa
                             except TelegramBadRequest as e:
                                 if "message is not modified" not in str(e):
                                     logger.error(f"Telegram update error: {e}")
+                    
                     logger.info(f"Download completed for {filename}")
     except Exception as e:
         logger.error(f"Download error for {filename}: {str(e)}")
@@ -247,6 +253,7 @@ async def download_file(dl_url: str, filename: str, size_mb: float, status_messa
             except:
                 pass
         return False, None
+    
     if status_message:
         try:
             await bot.delete_message(status_message.chat.id, status_message.message_id)
