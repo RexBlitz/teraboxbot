@@ -127,7 +127,8 @@ async def set_bot_commands(user_id: int = None):
         ]
         await bot.set_my_commands(commands, scope=types.BotCommandScopeChat(chat_id=user_id))
 
-aasync def get_links(source_url: str):
+async def get_links(source_url: str):
+
     api_url = f"{API_BASE}/api?url={source_url}"
     try:
         async with aiohttp.ClientSession() as session:
