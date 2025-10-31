@@ -127,7 +127,7 @@ async def set_bot_commands(user_id: int = None):
         ]
         await bot.set_my_commands(commands, scope=types.BotCommandScopeChat(chat_id=user_id))
 
-async def get_links(source_url: str):
+aasync def get_links(source_url: str):
     api_url = f"{API_BASE}/api?url={source_url}"
     try:
         async with aiohttp.ClientSession() as session:
@@ -136,18 +136,21 @@ async def get_links(source_url: str):
                 if not data.get("success"):
                     logger.error(f"API error: {data.get('error')}")
                     return None
-                # Convert Worker API response to unified structure for process_file
+
                 links = []
                 for f in data.get("files", []):
                     size_str = f.get("size", "0 MB")
                     size_mb = float(size_str.split()[0]) if "MB" in size_str else (
                         float(size_str.split()[0]) * 1024 if "GB" in size_str else 0
                     )
+
+                    # ✅ Always use proxified_download_url instead of direct/original
+                    proxified_url = f.get("proxified_download_url") or f.get("download_url")
+
                     links.append({
                         "name": f.get("file_name"),
                         "size_mb": size_mb,
-                        "original_url": f.get("original_download_url"),
-                        "direct_url": f.get("download_url"),
+                        "proxified_url": proxified_url
                     })
                 return {"links": links}
     except Exception as e:
@@ -299,28 +302,22 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
         try:
             for attempt in range(4):
                 if attempt == 0:
-                    dl_url = link["original_url"]
-                    label = "original"
-                elif attempt == 1:
-                    dl_url = link["direct_url"]
-                    label = "proxied fallback"
-                elif attempt == 2:
-                    logger.info(f"Refreshing links for {name}")
-                    new_resp = await get_links(source_url)
-                    if not new_resp or "links" not in new_resp:
-                        logger.error(f"Failed to refresh links for {name}")
-                        break
-                    new_link = next((l for l in new_resp["links"] if l.get("name") == name), None)
-                    if not new_link:
-                        logger.error(f"File {name} not found in refreshed links")
-                        break
-                    dl_url = new_link["original_url"]
-                    label = "refreshed original"
-                elif attempt == 3 and new_link:
-                    dl_url = new_link["direct_url"]
-                    label = "refreshed proxied"
-                else:
-                    break
+    dl_url = link.get("proxified_url")
+    label = "proxified"
+elif attempt == 1:
+    logger.info(f"Refreshing links for {name}")
+    new_resp = await get_links(source_url)
+    if not new_resp or "links" not in new_resp:
+        logger.error(f"Failed to refresh links for {name}")
+        break
+    new_link = next((l for l in new_resp["links"] if l.get("name") == name), None)
+    if not new_link:
+        logger.error(f"File {name} not found in refreshed links")
+        break
+    dl_url = new_link.get("proxified_url")
+    label = "refreshed proxified"
+else:
+    break
 
                 logger.info(f"Attempting {label} download for {name}")
                 success, file_path = await download_file(dl_url, name, size_mb, status_message)
