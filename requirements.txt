@@ -5,3 +5,4 @@ motor
 aiogram
 requests
 python-dotenv
+brotli
