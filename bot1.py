@@ -272,7 +272,14 @@ async def send_video_to_user(file_path: str, video_name: str, chat_id: int, repl
         await bot.send_message(chat_id, f"❌ Failed to send `{video_name}`: {str(e)[:100]}", parse_mode="Markdown")
         return False
 
-async def process_file(link: dict, source_url: str, original_chat_id: int = None, source_type: str = "user", status_message: Message = None, original_message: Message = None):
+async def process_file(
+    link: dict,
+    source_url: str,
+    original_chat_id: int = None,
+    source_type: str = "user",
+    status_message: Message = None,
+    original_message: Message = None
+):
     name = link.get("name", "unknown")
     size_mb = link.get("size_mb", 0)
     size_gb = size_mb / 1024
@@ -280,7 +287,7 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
 
     config = await get_config()
 
-    # Notify user before download
+    # === Step 1: Pre-download checks ===
     if status_message and source_type != "channel":
         if size_gb > 2:
             await status_message.edit_text(
@@ -294,62 +301,86 @@ async def process_file(link: dict, source_url: str, original_chat_id: int = None
                 parse_mode="Markdown",
             )
             return
-        await status_message.edit_text(f"📥 Found: `{name}`. Starting download...", parse_mode="Markdown")
+        await status_message.edit_text(
+            f"📥 Found: `{name}`. Starting download...",
+            parse_mode="Markdown",
+        )
 
     file_path = None
     new_link = None
 
+    # === Step 2: Main download logic with retry ===
     async with sem:
         try:
             for attempt in range(4):
                 if attempt == 0:
-    dl_url = link.get("proxified_url")
-    label = "proxified"
-elif attempt == 1:
-    logger.info(f"Refreshing links for {name}")
-    new_resp = await get_links(source_url)
-    if not new_resp or "links" not in new_resp:
-        logger.error(f"Failed to refresh links for {name}")
-        break
-    new_link = next((l for l in new_resp["links"] if l.get("name") == name), None)
-    if not new_link:
-        logger.error(f"File {name} not found in refreshed links")
-        break
-    dl_url = new_link.get("proxified_url")
-    label = "refreshed proxified"
-else:
-    break
+                    dl_url = link.get("proxified_url")
+                    label = "proxified"
+                elif attempt == 1:
+                    logger.info(f"🔁 Refreshing links for {name}")
+                    new_resp = await get_links(source_url)
+                    if not new_resp or "links" not in new_resp:
+                        logger.error(f"Failed to refresh links for {name}")
+                        break
 
-                logger.info(f"Attempting {label} download for {name}")
-                success, file_path = await download_file(dl_url, name, size_mb, status_message)
-                if success:
+                    new_link = next((l for l in new_resp["links"] if l.get("name") == name), None)
+                    if not new_link:
+                        logger.error(f"File {name} not found in refreshed links")
+                        break
+
+                    dl_url = new_link.get("proxified_url")
+                    label = "refreshed proxified"
+                else:
                     break
-                logger.warning(f"{label.capitalize()} failed for {name}, retrying...")
 
+                logger.info(f"⬇️ Attempting {label} download for {name}")
+                success, file_path = await download_file(dl_url, name, size_mb, status_message)
+
+                if success:
+                    logger.info(f"✅ {name} downloaded successfully using {label}")
+                    break
+                else:
+                    logger.warning(f"⚠️ {label.capitalize()} download failed for {name}, retrying...")
+
+            # === Step 3: Handle failure ===
             if not file_path:
-                logger.error(f"File {name} failed to download after all retries")
-                if status_message or source_type != "channel" or config["channel_broadcast_enabled"]:
-                    await bot.send_message(original_chat_id, f"❌ Failed to download `{name}` from `{source_url}` after all attempts.", parse_mode="Markdown")
+                logger.error(f"❌ {name} failed to download after all retries")
+                if status_message or (source_type != "channel" or config.get("channel_broadcast_enabled")):
+                    await bot.send_message(
+                        original_chat_id,
+                        f"❌ Failed to download `{name}` from `{source_url}` after all attempts.",
+                        parse_mode="Markdown",
+                    )
                 return
 
-            # Send video to appropriate destination
-            if source_type == "user" or source_type == "admin":
-                await send_video_to_user(file_path, name, original_chat_id, reply_to_message_id=original_message.message_id if original_message else None)
+            # === Step 4: Send downloaded video ===
+            if source_type in ["user", "admin"]:
+                await send_video_to_user(
+                    file_path,
+                    name,
+                    original_chat_id,
+                    reply_to_message_id=original_message.message_id if original_message else None
+                )
+
             if source_type == "admin":
                 await broadcast_video(file_path, name, 'admin')
-            elif source_type == "channel" and config["channel_broadcast_enabled"]:
+
+            elif source_type == "channel" and config.get("channel_broadcast_enabled"):
                 await broadcast_video(file_path, name, 'channel')
 
         except Exception as e:
-            logger.error(f"Error processing {name}: {str(e)}")
-            if status_message or source_type != "channel" or config["channel_broadcast_enabled"]:
-                await bot.send_message(original_chat_id, f"❌ Error processing `{name}`: {str(e)[:100]}", parse_mode="Markdown")
+            logger.error(f"💥 Error processing {name}: {str(e)}")
+            if status_message or (source_type != "channel" or config.get("channel_broadcast_enabled")):
+                await bot.send_message(
+                    original_chat_id,
+                    f"❌ Error processing `{name}`: {str(e)[:100]}",
+                    parse_mode="Markdown",
+                )
+
         finally:
             if file_path and os.path.exists(file_path):
-                logger.debug(f"Cleaning up temporary file: {file_path}")
+                logger.debug(f"🧹 Cleaning up temporary file: {file_path}")
                 os.unlink(file_path)
-
-
 
 
 async def process_url(source_url: str, chat_id: int, source_type: str = "user", original_message: Message = None):
